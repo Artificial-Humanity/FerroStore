@@ -1,10 +1,12 @@
 # FerroStore (`fl-store`)
 
-**A single-file embedded store: JSON documents with BM25 search, a durable message queue (FerroMQ), columnar tables, and HNSW vector and hybrid search, all in one `.fls` file or entirely in memory, optionally served over a Unix socket or `ws://`.**
+**A single-file embedded store: JSON documents with BM25 search, a durable message queue (FerroMQ), columnar tables, and HNSW vector and hybrid search, all in one `.fls` file or entirely in memory, optionally served over a Unix socket, `ws://` or `wss://`, with a `ferrostore` command-line tool.**
 
 FerroStore is an independent sub-product of the [FerroLoop](https://github.com/Artificial-Humanity/FerroLoop) suite. It can be used standalone as a Rust library, the `fl-store` crate. `FerroStore` also implements FerroLoop's `fl-core` store traits, so FerroLoop can use it as a storage backend. The file format and the wire protocol are specified in [docs/ferrostore-spec.md](docs/ferrostore-spec.md); this README is the overview, and the spec is the authority.
 
 FerroStore is Unix-only: it takes an advisory `flock` on the file and uses Unix sockets, through `std::os::unix`.
+
+The crate builds a library and the `ferrostore` binary. The binary and the shared argument types in `fl_store::cli::args` are behind the `cli` feature, which is on by default.
 
 ## Storage models
 
@@ -27,11 +29,23 @@ All integers are little-endian. Checksums are CRC-32 (ISO-HDLC, the zlib polynom
 | `4096..8192` | Superblock slot 1 |
 | `8192..` | Snapshot and WAL bytes |
 
-* **Superblocks.** Each slot is 4096 bytes, begins with the magic `FERRSTR1` and carries a format version, a monotonic `epoch`, a CRC-32, and the offsets and lengths of the current snapshot and WAL. The current superblock is the valid slot with the highest `epoch`. Every commit writes the inactive slot with `epoch + 1` and `fsync`s, so a torn write fails its CRC and the other slot stays current.
-* **Snapshot.** A copy-on-write blob with the magic `FERRSNAP`, written by `checkpoint`. Version 1 holds documents only, version 2 adds column tables, and version 3 is written when any vector collection exists. A version 1 snapshot still opens.
+* **Superblocks.** Each slot is 4096 bytes, begins with the magic `FERRSTR1` and carries a container format version (this build writes `2` and still reads `1`), a monotonic `epoch`, a CRC-32, the offsets and lengths of the current snapshot and WAL, an `engine` field and `incompat` feature bits. The current superblock is the valid slot with the highest `epoch`. Every publish writes the inactive slot with `epoch + 1` and `fsync`s, so a torn write fails its CRC and the other slot stays current. A slot written by a newer build is refused with `StoreError::ContainerFormat`, not read as torn.
+* **Snapshot.** A copy-on-write blob with the magic `FERRSNAP`. A live snapshot's bytes are never overwritten. Version 1 holds documents only, version 2 adds column tables, and version 3 is written when any vector collection exists. A version 1 snapshot still opens.
 * **WAL.** Committed transactions are CRC-32 framed (payload length, payload CRC, payload). Each transaction has a file-wide, 1-based `seq`. Replay stops at a torn tail, and treats a bad frame that is followed by another complete frame, or a gap in `seq`, as corruption.
 * **Derived state.** Secondary indexes and BM25 statistics are rebuilt from the documents after replay. They are not written to the file. Neither are the subscriber list or any sync adapter.
-* **Concurrency.** Writers take `flock` (exclusive) only across the commit critical section, re-read the latest state under the lock, then append and publish the new superblock. Readers use a separate read-only descriptor and take no lock. Two `FerroStore::open` handles on one path both succeed.
+* **Permissions.** A new store file is mode `0600` from its first byte, and a missing parent directory is made mode `0700`. An existing file keeps its mode; one that other users can read gets a warning.
+
+## Engine
+
+The spec sections "File layout", "Compaction" and "Concurrency" are the authority; in outline:
+
+* **Copy-on-write.** No extent of a file is rewritten in place. A commit appends to the WAL and then publishes a new superblock; a `checkpoint` writes a new snapshot past both the live snapshot and the live WAL, `fsync`s it, and then publishes. A crash at any point leaves readers on the previous superblock.
+* **Epoch cache.** Each handle keeps the decoded state of the file and the epoch it was read at. A read compares the superblocks with that epoch and, when a writer has published since, decodes and applies only the new WAL frames, copy-on-write, to the cached state. A full load runs only when the new frames do not follow on from the cached ones (after a checkpoint or a compaction, for example). Readers use a separate read-only descriptor and take no lock.
+* **Group commit.** Concurrent writers to one store queue up. The first writer leads: it takes the write lock and the exclusive `flock`, refreshes, and takes what is queued (at most 64 members) as its group. Each member's body runs on its own thread against the group's running state, and the leader publishes all the frames with one data `fsync` and one superblock write. A member's failure drops only its own writes. Nobody waits to batch.
+* **Transactions.** `FerroStore::transaction` runs a body over a `Transaction` and commits all its writes as one sequence and one WAL frame, or none of them. On disk the body runs under the write lock, inside a group commit.
+* **Auto-checkpoint.** A commit whose WAL has grown past `max(snapshot_length, 4 MiB)` checkpoints after the commit's lock window, so no other writer's result waits for it. A failed auto-checkpoint does not fail the commit; it is tried again once the WAL has grown by another threshold.
+* **Compaction.** Checkpoints leave the replaced snapshots and WALs in the file as dead bytes. `FerroStore::compact` writes the current state into a new sibling file and renames it over the store, keeping the epoch rising and `last_seq` unchanged; other handles detect the swap by `(dev, ino)` and move to the new file. A checkpoint that leaves more dead bytes than `max(live bytes, 64 MiB)` is followed by a compaction automatically. `FerroStore::stats` reports the file, live and dead bytes, the epoch and `last_seq`.
+* **Durability.** A failed `fsync` poisons the handle: later writes through it are refused rather than trusted. A handle also makes the directory entry that names its file durable before its first commit into it.
 
 ## Quick start
 
@@ -79,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`FerroStore::connect_uri` accepts `mem://`, `file://`, `unix://` and `ws://` URIs (see [Served mode](#served-mode)). `wss://` is recognized and refused with an error, and any other scheme is an error.
+`FerroStore::connect_uri` accepts `mem://`, `file://`, `unix://`, `ws://` and `wss://` URIs (see [Served mode](#served-mode)); any other scheme is an error. `FerroStore::connect_with(uri, &ConnectOptions)` adds a credential and TLS options.
 
 ## Document / BM25 engine
 
@@ -101,11 +115,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 A `FerroStoreServer` owns the store and is the only opener of the `.fls` file; clients never open the file or take a lock (spec, "Served mode").
 
-* `FerroStoreServer::bind_unix(path, store)` serves a Unix socket. A frame is a 4-byte big-endian length followed by that many bytes of UTF-8 JSON, between 1 byte and 16 MiB.
-* `FerroStoreServer::bind_tcp(addr, store)` serves RFC 6455 WebSocket. One JSON object is one message, client frames are masked, and the payload is limited to 16 MiB. A client connects with a `ws://host:port` URI.
-* Each call is `{"id": 1, "method": "put_doc", "params": {...}}`, answered by `{"id": 1, "ok": true, "result": ...}` or `{"id": 1, "ok": false, "error": "..."}`. The spec lists every method and its parameters: documents, FerroMQ, columnar, vectors, hybrid search, `read_state` and the compare-and-swap `commit_ops`.
-* A client built by `connect_uri("unix://...")` or `connect_uri("ws://...")` exposes the same `FerroStore` methods. A remote write retries the compare-and-swap until it succeeds, so concurrent remote writers do not lose updates.
-* `FerroStore::auto(path)` connects to the default socket for a store file (`default_socket_path_for_store` appends `.sock` to the file name), and opens the file in embedded mode when nothing is listening.
+* **Transports.** `FerroStoreServer::bind_unix(path, store)` serves a Unix socket (mode `0600`). A frame is a 4-byte big-endian length followed by that many bytes of UTF-8 JSON, between 1 byte and 16 MiB. `FerroStoreServer::bind_tcp(addr, store, auth)` serves RFC 6455 WebSocket, one JSON object per message, at `ws://host:port`, or at `wss://host:port` when the `ServerAuth` carries a TLS certificate and key.
+* **Calls.** Each call is `{"id": 1, "method": "put_doc", "params": {...}}`, answered by `{"id": 1, "ok": true, "result": ...}` or `{"id": 1, "ok": false, "error": "..."}`. The spec lists every method and its parameters. Every write method takes an optional request id, so a resend after a lost reply never applies a write twice.
+* **Authentication.** Every connection authenticates before its first request. A Unix connection is checked by peer uid (`SO_PEERCRED`), and optionally by a pre-shared key. A TCP bind needs a PSK, a bearer-token file, or both: tokens are stored as SHA-256 hashes with a `read`, `write` or `admin` scope, and the PSK runs a mutual HMAC-SHA256 challenge-response that, over `wss://`, is bound to the TLS session's exporter. Secret files must be mode `0600` or stricter. Each method needs a scope; unauthenticated connections are bounded in time, size and number.
+* **TLS.** The server speaks TLS 1.3 and 1.2 through `rustls` with the `ring` provider. A `wss://` client verifies the server against the bundled Mozilla roots (`webpki-roots`), a CA file, or a pinned SubjectPublicKeyInfo SHA-256. Without TLS, `bind_tcp` binds only loopback or an address of an interface named with `ServerAuth::allow_plaintext_on`, and never `0.0.0.0` or `::`.
+* **Remote transactions and read sessions.** A remote client never receives the whole state. A remote transaction runs its body on the client over a read session that pins one server snapshot; each read is answered with a hash, and `commit_txn` sends the read set with the ops. The server re-checks every read under the write lock and commits only when all still match, so remote transactions are serializable. A lost commit runs the body again over a new session, at most 8 attempts, and then returns `StoreError::Conflict`. Sessions expire after 30 s idle or 5 minutes, and are capped per connection, per credential and per server.
+* **Auto.** `FerroStore::auto(path)` connects to the default socket for a store file (`default_socket_path_for_store` appends `.sock` to the file name), and opens the file in embedded mode when nothing is listening.
+
+A served store with a token over TLS:
+
+```rust
+use fl_store::{ConnectOptions, FerroStore, FerroStoreServer, ServerAuth};
+
+fn serve() -> Result<(), Box<dyn std::error::Error>> {
+    let auth = ServerAuth::new()
+        .with_token_file("tokens")?            // "<sha256 hex> <scope> <label>" per line
+        .with_tls_files("cert.pem", "key.pem")?;
+    let _server = FerroStoreServer::bind_tcp("0.0.0.0:7400", FerroStore::open("demo.fls")?, auth)?;
+    let client = FerroStore::connect_with(
+        "wss://store.example:7400",
+        &ConnectOptions::token_file("client-token").ca_file("ca.pem"),
+    )?;
+    let _doc = client.get_doc("notes", "n1")?;
+    Ok(())
+}
+```
 
 ## Columnar analytics
 
@@ -135,17 +169,37 @@ A process may attach one `SyncAdapter` to replicate commits to a cloud service o
 * The adapter, the mode, the pending batches and `synced_seq` are process memory. They are not written to the `.fls` file.
 * `RecordEnvelope` and `EnvelopeKind` give a lossless per-op record form of a batch for replication.
 
+## The `ferrostore` command
+
+`cargo install --git https://github.com/Artificial-Humanity/FerroStore.git fl-store` installs the `ferrostore` binary (spec, "Command line"). A store is named with `--store`; a path `x.redb` or `x` names `x.fls`. A failure prints `error: ...` on stderr and exits 2.
+
+| Command | What it does |
+| --- | --- |
+| `status --store PATH` | The engine, files, size, live and dead bytes and format version. Read-only. `--json` |
+| `checkpoint --store PATH` | Folds the WAL into a new snapshot |
+| `compact --store PATH` | Gives back dead bytes (see [Engine](#engine)). `--json` |
+| `migrate --store PATH.redb` | A verified copy of a `.redb` store into the sibling `.fls`; the `.redb` is kept read-only. `--dry-run`, `--json` |
+| `verify --store PATH.redb` | Compares a `.redb` and its `.fls` table by table. Exit 1 when they differ |
+| `serve --store PATH` | Serves the store on a Unix socket (`--socket`, default `<file>.fls.sock`) or on TCP (`--tcp ADDR` with `--psk-file` and `--server-id`, `--token-file`, `--tls-cert` and `--tls-key`, `--allow-plaintext-on IFACE`) until SIGINT or SIGTERM. `--create` makes a missing store |
+| `get --store PATH\|URI COLLECTION ID` | Prints a document as JSON. Exit 1 when it is missing |
+| `put --store PATH\|URI COLLECTION ID JSON\|-` | Puts a document (`-` reads stdin). `--create` makes a missing store |
+| `query --store PATH\|URI COLLECTION FIELD VALUE` | Field query; `--bm25` for BM25 text search, `--vector --values JSON` for vector search, `-k N` for the number of hits |
+| `inspect PATH` | Both superblock slots, the schema version, counts and live and dead bytes, read without a lock. `--json` |
+| `bench` | Times put, get, scan and vector workloads on fresh stores. `--json` |
+
+`get`, `put` and `query` take a path (opened embedded) or a `unix://`, `ws://` or `wss://` URI, with the client flags `--psk-file` and `--server-id`, `--token-file`, `--ca-file` or `--pin-spki`, and `--allow-plaintext`. The `fl store` command of FerroLoop calls the same functions and prints the same output.
+
 ## Relation to FerroLoop and the redb store
 
 The crate also contains the redb-backed `RedbStore` and FerroLoop's store roles over it (catalog, routing, tracker, ledger, state, messaging and workflow roles, among others), and `FerroStore` implements those same `fl-core` store traits. `migrate_redb_to_ferrostore` copies a `RedbStore` into an empty `FerroStore`. These parts exist for FerroLoop and are not needed to use FerroStore as a document, queue, columnar or vector store.
 
 ### Why `fl-core` is pinned
 
-`fl-store` depends on `fl-core`, FerroLoop's core crate, for its error and store trait types. `fl-core` is a crate in the FerroLoop workspace, so `Cargo.toml` takes it from the FerroLoop repository, pinned to a commit with `rev = "af85c42feb097fa2e1e483391c774a2044dfce0c"`, and `Cargo.lock` is committed. The pin keeps this repository's build reproducible and tied to the exact core API the extracted code was tested against; move it deliberately, and run the verification commands below when you do. The dev-dependency on `fl-core` enables its `conformance` feature for the store test suite.
+`fl-store` depends on `fl-core`, FerroLoop's core crate, for its error and store trait types. `fl-core` is a crate in the FerroLoop workspace, so `Cargo.toml` takes it from the FerroLoop repository, pinned to a commit with `rev = "2573b2ad01ed8a8ed45fe37f07d4aa5403ca439c"`, and `Cargo.lock` is committed. The pin keeps this repository's build reproducible and tied to the exact core API the extracted code was tested against; move it deliberately, and run the verification commands below when you do. The dev-dependency on `fl-core` enables its `conformance` feature for the store test suite.
 
 ## Installation
 
-FerroStore is a library crate and needs Rust 1.98 or newer (edition 2024):
+FerroStore needs Rust 1.98 or newer (edition 2024):
 
 ```bash
 git clone https://github.com/Artificial-Humanity/FerroStore.git
@@ -153,7 +207,7 @@ cd FerroStore
 cargo build
 ```
 
-To use it from another project, add the git dependency shown in [Quick start](#quick-start). Cargo fetches `fl-core` from the FerroLoop repository, so a build needs network access to GitHub the first time.
+To use it from another project, add the git dependency shown in [Quick start](#quick-start); add `default-features = false` to leave out the `cli` feature and `clap`. Cargo fetches `fl-core` from the FerroLoop repository, so a build needs network access to GitHub the first time.
 
 ## Verification
 
@@ -163,7 +217,7 @@ cargo clippy --all-targets --workspace -- -D warnings
 cargo test --workspace
 ```
 
-The tests use temporary directories and in-process servers on Unix sockets and loopback TCP. They need no external service.
+The tests use temporary directories and in-process servers on Unix sockets and loopback TCP, and the test TLS certificates in `src/ferrostore/testdata/tls` (test-only keys, see the README there). They need no external service.
 
 ## License
 

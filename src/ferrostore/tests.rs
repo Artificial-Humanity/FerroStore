@@ -1,4 +1,5 @@
 use super::layout::{self, Op, Superblock};
+use super::tests_auth::psk_auth;
 use super::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnType, ColumnValue, FerroStore,
     FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit, VectorMetric, VectorStorage,
@@ -31,7 +32,7 @@ fn slots(path: &Path) -> [Option<Superblock>; 2] {
         let mut buf = [0u8; layout::SLOT_LEN];
         file.read_exact_at(&mut buf, index as u64 * layout::SLOT_LEN as u64)
             .unwrap();
-        *slot = layout::parse_superblock(&buf);
+        *slot = layout::parse_superblock(&buf).valid();
     }
     out
 }
@@ -79,6 +80,33 @@ fn seed(path: &Path) {
         .unwrap();
 }
 
+/// The table CRC equals the bit-at-a-time one at every length 0..=64 (each tail length after
+/// whole 8-byte steps) and every offset into the buffer, and on a large buffer.
+#[test]
+fn the_table_crc32_equals_the_bitwise_crc32() {
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    let data: Vec<u8> = (0..1 << 16)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect();
+    for start in 0..8 {
+        for len in 0..=64 {
+            let part = &data[start..start + len];
+            assert_eq!(
+                layout::crc32(part),
+                layout::crc32_bitwise(part),
+                "start {start}, len {len}"
+            );
+        }
+    }
+    assert_eq!(layout::crc32(&data), layout::crc32_bitwise(&data));
+    assert_eq!(layout::crc32(&[]), 0);
+}
+
 #[test]
 fn crc32_iso_hdlc_and_superblock_round_trip() {
     assert_eq!(layout::crc32(b"123456789"), 0xCBF4_3926);
@@ -91,13 +119,13 @@ fn crc32_iso_hdlc_and_superblock_round_trip() {
         snapshot_seq: 5,
     };
     let bytes = layout::encode_superblock(&sb);
-    assert_eq!(layout::parse_superblock(&bytes), Some(sb));
+    assert_eq!(layout::parse_superblock(&bytes).valid(), Some(sb));
     let mut torn = bytes;
     torn[20] ^= 0xff;
-    assert!(layout::parse_superblock(&torn).is_none());
+    assert!(layout::parse_superblock(&torn).valid().is_none());
     torn = bytes;
     torn[64] = 1;
-    assert!(layout::parse_superblock(&torn).is_none());
+    assert!(layout::parse_superblock(&torn).valid().is_none());
 }
 
 #[test]
@@ -305,13 +333,10 @@ fn unpublished_snapshot_past_the_live_extent_keeps_committed_documents() {
     let mut docs = BTreeMap::new();
     docs.insert(("docs".into(), "kept".into()), json!({ "n": 99 }));
     docs.insert(("docs".into(), "ghost".into()), json!({ "n": 7 }));
-    let blob = layout::encode_snapshot(99, &docs).unwrap();
+    let blob = layout::encode_snapshot(99, &docs.into()).unwrap();
     let snap = layout::decode_snapshot(&blob).unwrap();
     assert_eq!(snap.seq, 99);
-    assert_eq!(
-        snap.docs.get(&("docs".into(), "ghost".into())).unwrap()["n"],
-        7
-    );
+    assert_eq!(snap.docs.get("docs", "ghost").unwrap()["n"], 7);
 
     {
         let file = OpenOptions::new()
@@ -610,6 +635,11 @@ fn ferromq_redelivers_until_ack_and_subscribers_see_the_next_publish() {
     assert_eq!(store.publish_mq("orders", "k4", &json!(4)).unwrap(), 4);
 }
 
+/// A `ws://` client under the test PSK of [`psk_auth`].
+fn connect_psk(uri: &str) -> Result<FerroStore, StoreError> {
+    FerroStore::connect_with(uri, &super::tests_auth::psk_options())
+}
+
 fn must_not_unreachable<T>(result: Result<T, StoreError>) -> Result<T, String> {
     match result {
         Ok(value) => Ok(value),
@@ -826,7 +856,8 @@ fn websocket_serves_concurrent_clients_without_opening_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("store.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     assert_ne!(server.local_addr().port(), 0);
     let uri = format!("ws://{}", server.local_addr());
 
@@ -834,7 +865,7 @@ fn websocket_serves_concurrent_clients_without_opening_the_file() {
     for i in 0..4 {
         let uri = uri.clone();
         handles.push(thread::spawn(move || {
-            let client = must_not_unreachable(FerroStore::connect_uri(&uri))?;
+            let client = must_not_unreachable(connect_psk(&uri))?;
             let id = format!("id-{i}");
             must_not_unreachable(client.put_doc(
                 "docs",
@@ -879,23 +910,24 @@ fn websocket_mq_subscribe_does_not_replay_and_ack_matches_local() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("store.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let uri = format!("ws://{}", server.local_addr());
 
-    let publisher = FerroStore::connect_uri(&uri).unwrap();
+    let publisher = connect_psk(&uri).unwrap();
     let early = publisher
         .publish_mq("orders", "before", &json!({"n": 0}))
         .unwrap();
     assert_eq!(early, 1);
 
-    let client_a = FerroStore::connect_uri(&uri).unwrap();
+    let client_a = connect_psk(&uri).unwrap();
     let rx = client_a.subscribe_mq("orders");
     assert!(
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
         "subscribe does not replay history"
     );
 
-    let client_b = FerroStore::connect_uri(&format!("{uri}/store")).unwrap();
+    let client_b = connect_psk(&format!("{uri}/store")).unwrap();
     let seq = client_b
         .publish_mq("orders", "k", &json!({"n": 1}))
         .unwrap();
@@ -955,8 +987,9 @@ fn websocket_get_doc_returns_stored_null() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("null.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}/store", server.local_addr())).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
+    let client = connect_psk(&format!("ws://{}/store", server.local_addr())).unwrap();
     client.put_doc("docs", "empty", &json!(null)).unwrap();
     let stored = client.get_doc("docs", "empty");
     assert!(
@@ -979,8 +1012,9 @@ fn websocket_get_doc_returns_stored_null() {
 
 #[test]
 fn websocket_subscribe_disconnects_when_the_server_drops() {
-    let server = FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::in_memory()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::in_memory(), psk_auth()).unwrap();
+    let client = connect_psk(&format!("ws://{}", server.local_addr())).unwrap();
     let rx = client.subscribe_mq("orders");
     drop(server);
     assert_eq!(
@@ -1344,7 +1378,6 @@ fn gate_selector() -> fl_core::model::Selector {
 }
 
 fn redb_format(store: &crate::RedbStore) -> u64 {
-    use redb::ReadableDatabase;
     let tx = store.db.begin_read().unwrap();
     let meta = tx.open_table(crate::META).unwrap();
     meta.get(crate::FORMAT_KEY)
@@ -1423,7 +1456,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
     redb.upsert_area(area).unwrap();
     let agent = redb
         .register_agent(RegisterAgentArgs {
-            display_name: "ferris".into(),
+            display_name: "bob".into(),
             email: None,
             project: "ferroloop".into(),
             role: AgentRole::Lead,
@@ -1448,7 +1481,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
                 notes: None,
             }),
             at: At::from_unix_millis(10),
-            by: "jarvis".into(),
+            by: "carol".into(),
         })
         .unwrap();
 
@@ -1464,7 +1497,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
                 title: "Build".into(),
                 prompt: "Run build.".into(),
                 assignee: AssigneeRule::Agent {
-                    name: "felicia".into(),
+                    name: "alice".into(),
                 },
                 reviews_step: None,
                 require_different_vendor: false,
@@ -1486,7 +1519,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
             max_tokens: None,
             declared_keys: BTreeMap::new(),
             authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            authored_by: "ferris".into(),
+            authored_by: "bob".into(),
         })
         .unwrap();
     let workflow_run = redb
@@ -1496,7 +1529,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
                 &workflow,
                 "CI Run 1",
                 At::from_unix_millis(100),
-                "ferris",
+                "bob",
             )
             .unwrap(),
         )
@@ -1506,9 +1539,9 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
         .send_wire(SendWireArgs {
             id: None,
             sender_id: None,
-            sender_name: "jarvis".into(),
+            sender_name: "carol".into(),
             sender_host: Some("build-host".into()),
-            to: WireAddress::AgentName("ferris".into()),
+            to: WireAddress::AgentName("bob".into()),
             kind: MessageKind::Mail,
             urgency: MessageUrgency::Normal,
             durable: false,
@@ -1608,7 +1641,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
         redb.get_wire_message(&message.id).unwrap()
     );
     let filter = WireFilter {
-        recipient: Some("ferris".into()),
+        recipient: Some("bob".into()),
         ..WireFilter::default()
     };
     assert_eq!(
@@ -1630,10 +1663,13 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
         assert!(handle.is_some(), "{kind:?} has no handle");
         assert_eq!(ferro.handle_of(kind, id).unwrap(), handle);
     }
+    // The schema version is the source's, kept once, in `__meta`.
+    assert_eq!(ferro.format_version().unwrap(), Some(version));
     assert_eq!(
-        ferro.get_doc("meta", "format_version").unwrap(),
+        ferro.get_doc("__meta", "schema_version").unwrap(),
         Some(json!(version))
     );
+    assert_eq!(ferro.get_doc("meta", "format_version").unwrap(), None);
 }
 
 #[test]
@@ -1709,10 +1745,17 @@ fn nonzero_short_file_is_not_initialized() {
     {
         FerroStore::open(&path).unwrap();
     }
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
     let created = slots(&path);
     assert!(created[0].is_some());
     assert!(created[1].is_none());
+    // The header, then the snapshot that holds the new store's schema version.
+    let first = created[0].unwrap();
+    assert_eq!(first.snapshot_offset, 8192);
+    assert!(first.snapshot_length > 0);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        8192 + first.snapshot_length
+    );
     corrupt_live_crc(&path);
     assert!(slots(&path).iter().all(Option::is_none));
     let file = File::open(&path).unwrap();
@@ -1728,7 +1771,10 @@ fn nonzero_short_file_is_not_initialized() {
         matches!(err, StoreError::Backend(_)) && msg.contains("no valid FerroStore superblock"),
         "{msg}"
     );
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        8192 + first.snapshot_length
+    );
     let file = File::open(&path).unwrap();
     let mut after = [0u8; 8192];
     file.read_exact_at(&mut after, 0).unwrap();
@@ -1756,32 +1802,52 @@ fn parse_superblock_rejects_epoch_zero_and_illegal_extents() {
         snapshot_seq: 0,
     };
     assert_eq!(
-        layout::parse_superblock(&layout::encode_superblock(&legal)),
+        layout::parse_superblock(&layout::encode_superblock(&legal)).valid(),
         Some(legal)
     );
 
     let mut epoch_zero = legal;
     epoch_zero.epoch = 0;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&epoch_zero)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&epoch_zero))
+            .valid()
+            .is_none()
+    );
 
     let mut snapshot_short = legal;
     snapshot_short.snapshot_offset = 8191;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&snapshot_short)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&snapshot_short))
+            .valid()
+            .is_none()
+    );
 
     let mut wal_inside_header = legal;
     wal_inside_header.wal_offset = 0;
     wal_inside_header.wal_length = 0;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&wal_inside_header)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&wal_inside_header))
+            .valid()
+            .is_none()
+    );
 
     let mut snapshot_wraps = legal;
     snapshot_wraps.snapshot_offset = 8192;
     snapshot_wraps.snapshot_length = u64::MAX;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&snapshot_wraps)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&snapshot_wraps))
+            .valid()
+            .is_none()
+    );
 
     let mut wal_wraps = legal;
     wal_wraps.wal_offset = 8192;
     wal_wraps.wal_length = u64::MAX;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&wal_wraps)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&wal_wraps))
+            .valid()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1808,7 +1874,7 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
     let mut state = super::state::DocState::at_seq(10);
     state
         .docs
-        .insert(("docs".into(), "kept".into()), json!("kept"));
+        .insert("docs".into(), "kept".into(), json!("kept").into());
     let err = super::state::apply_frames(
         &mut state,
         10,
@@ -1816,17 +1882,14 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
     )
     .unwrap_err();
     assert_corrupt(err);
-    assert_eq!(
-        state.docs.get(&("docs".into(), "kept".into())),
-        Some(&json!("kept"))
-    );
+    assert_eq!(state.docs.get("docs", "kept"), Some(&json!("kept")));
     assert_eq!(state.docs.len(), 1);
     assert_eq!(state.last_seq, 10);
 
     let mut state = super::state::DocState::at_seq(10);
     state
         .docs
-        .insert(("docs".into(), "kept".into()), json!("kept"));
+        .insert("docs".into(), "kept".into(), json!("kept").into());
     let err = super::state::apply_frames(
         &mut state,
         10,
@@ -1834,17 +1897,14 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
     )
     .unwrap_err();
     assert_corrupt(err);
-    assert_eq!(
-        state.docs.get(&("docs".into(), "kept".into())),
-        Some(&json!("kept"))
-    );
+    assert_eq!(state.docs.get("docs", "kept"), Some(&json!("kept")));
     assert_eq!(state.docs.len(), 1);
     assert_eq!(state.last_seq, 10);
 
     let mut state = super::state::DocState::at_seq(2);
     state
         .docs
-        .insert(("docs".into(), "kept".into()), json!("kept"));
+        .insert("docs".into(), "kept".into(), json!("kept").into());
     super::state::apply_frames(
         &mut state,
         2,
@@ -1855,16 +1915,10 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
         ],
     )
     .unwrap();
-    assert_eq!(
-        state.docs.get(&("docs".into(), "kept".into())),
-        Some(&json!("kept"))
-    );
-    assert_eq!(
-        state.docs.get(&("docs".into(), "new".into())),
-        Some(&json!("new"))
-    );
-    assert!(!state.docs.contains_key(&("docs".into(), "skip-a".into())));
-    assert!(!state.docs.contains_key(&("docs".into(), "skip-b".into())));
+    assert_eq!(state.docs.get("docs", "kept"), Some(&json!("kept")));
+    assert_eq!(state.docs.get("docs", "new"), Some(&json!("new")));
+    assert!(!state.docs.contains("docs", "skip-a"));
+    assert!(!state.docs.contains("docs", "skip-b"));
     assert_eq!(state.last_seq, 3);
 
     let mut state = super::state::DocState::at_seq(5);
@@ -1895,14 +1949,8 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
         &[(1, vec![put("one")]), (2, vec![put("two")])],
     )
     .unwrap();
-    assert_eq!(
-        state.docs.get(&("docs".into(), "one".into())),
-        Some(&json!("one"))
-    );
-    assert_eq!(
-        state.docs.get(&("docs".into(), "two".into())),
-        Some(&json!("two"))
-    );
+    assert_eq!(state.docs.get("docs", "one"), Some(&json!("one")));
+    assert_eq!(state.docs.get("docs", "two"), Some(&json!("two")));
     assert_eq!(state.last_seq, 2);
 }
 
@@ -2046,7 +2094,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
                 notes: None,
             }),
             at: At::from_unix_millis(10),
-            by: "jarvis".into(),
+            by: "carol".into(),
         })
         .unwrap();
     let got_state = store.get_state(&state.id).unwrap().expect("state");
@@ -2066,7 +2114,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
                 title: "Build".into(),
                 prompt: "Run build.".into(),
                 assignee: AssigneeRule::Agent {
-                    name: "felicia".into(),
+                    name: "alice".into(),
                 },
                 reviews_step: None,
                 require_different_vendor: false,
@@ -2088,7 +2136,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
             max_tokens: None,
             declared_keys: BTreeMap::new(),
             authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            authored_by: "ferris".into(),
+            authored_by: "bob".into(),
         })
         .unwrap();
     let got_workflow = store
@@ -2105,7 +2153,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
                 &got_workflow,
                 format!("CI run {tag}"),
                 At::from_unix_millis(20),
-                "ferris",
+                "bob",
             )
             .unwrap(),
         )
@@ -2132,7 +2180,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
         .send_wire(SendWireArgs {
             id: None,
             sender_id: None,
-            sender_name: "jarvis".into(),
+            sender_name: "carol".into(),
             sender_host: Some("build-host".into()),
             to: WireAddress::AgentName(agent_name),
             kind: MessageKind::Mail,
@@ -2247,9 +2295,10 @@ fn store_traits_run_over_unix_ws_and_auto() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("traits.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
-    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    let client = connect_psk(&format!("ws://127.0.0.1:{port}")).unwrap();
     exercise_store_traits(&client, "ws");
     drop(client);
     drop(server);
@@ -2280,10 +2329,11 @@ fn remote_with_write_commits_both_ops_in_one_frame() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("cas.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
     let uri = format!("ws://127.0.0.1:{port}");
-    assert_concurrent_increments(|| FerroStore::connect_uri(&uri).unwrap(), &file);
+    assert_concurrent_increments(|| connect_psk(&uri).unwrap(), &file);
     drop(server);
 
     let dir = tempfile::tempdir().unwrap();
@@ -2547,9 +2597,10 @@ fn served_column_scan_works_over_unix_and_ws_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("cols.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
-    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    let client = connect_psk(&format!("ws://127.0.0.1:{port}")).unwrap();
     exercise_served_columns(&client);
     drop(client);
     drop(server);
@@ -2695,8 +2746,9 @@ fn attempt_and_gate_rollups_match_hand_sums_locally_and_over_unix() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("roll.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
+    let client = connect_psk(&format!("ws://{}", server.local_addr())).unwrap();
     assert_rollups(&client);
     drop(client);
     drop(server);
@@ -2835,8 +2887,9 @@ fn non_finite_floats_round_trip_locally_and_over_unix_and_ws() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("floats.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
+    let client = connect_psk(&format!("ws://{}", server.local_addr())).unwrap();
     assert_non_finite_round_trip(&client);
     drop(client);
     drop(server);
@@ -2918,8 +2971,8 @@ fn a_row_group_that_does_not_decode_is_not_written() {
 
 #[test]
 fn a_version_2_snapshot_with_no_tables_or_a_bad_group_is_corrupt() {
-    let docs: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
-    let tables: BTreeMap<String, super::columnar::ColumnTable> = BTreeMap::new();
+    let docs = super::state::Docs::default();
+    let tables = super::state::Tables::new();
     let blob = layout::encode_snapshot_v2(1, &docs, &tables).unwrap();
     let err = match layout::decode_snapshot(&blob) {
         Ok(_) => panic!("version-2 snapshot with no tables opened"),
@@ -2927,13 +2980,14 @@ fn a_version_2_snapshot_with_no_tables_or_a_bad_group_is_corrupt() {
     };
     assert!(err.to_string().contains("no column tables"), "{err}");
 
-    let mut tables = BTreeMap::new();
+    let mut tables = super::state::Tables::new();
     tables.insert(
         "t".into(),
         super::columnar::ColumnTable {
             columns: int_column(),
             groups: vec![vec![0, 0, 0, 0]],
-        },
+        }
+        .into(),
     );
     let blob = layout::encode_snapshot_v2(1, &docs, &tables).unwrap();
     let err = match layout::decode_snapshot(&blob) {
@@ -3362,14 +3416,14 @@ fn exercise_vector_rpc(client: &FerroStore, file: &Path) {
     ] {
         assert!(matches!(search, StoreError::Backend(_)), "{search}");
     }
-    let remote = client.read_state().unwrap();
+    // The client never receives the whole state (spec §6.1); the file the
+    // server wrote holds the graph its upserts built.
+    assert!(client.read_state().is_err());
     let disk = FerroStore::open(file).unwrap().read_state().unwrap();
-    assert_eq!(remote.vectors, disk.vectors);
-    assert_eq!(remote.docs, disk.docs);
-    assert_eq!(remote.last_seq, disk.last_seq);
-    assert!(remote.vectors["emb"].entry.is_some());
+    assert_eq!(client.last_seq().unwrap(), disk.last_seq);
+    assert!(disk.vectors["emb"].entry.is_some());
     assert!(
-        remote.vectors["emb"]
+        disk.vectors["emb"]
             .vectors
             .values()
             .any(|record| record.neighbors.iter().any(|layer| !layer.is_empty()))
@@ -3781,12 +3835,14 @@ fn vector_rpc_works_over_unix_and_ws() {
     let err = raw.call("search_hybrid", bad_k).unwrap_err();
     assert!(err.to_string().contains("k"), "{err}");
 
-    let seq = client.read_state().unwrap().last_seq;
+    // Vector ops in a `commit_txn` are checked and applied on the server,
+    // HNSW and all, as a local write applies them.
+    let seq = client.last_seq().unwrap();
     let err = raw
         .call(
-            "commit_ops",
+            "commit_txn",
             json!({
-                "expected_seq": seq,
+                "reads": [],
                 "ops": [{
                     "op": "upsert_vector",
                     "collection": "missing",
@@ -3797,7 +3853,7 @@ fn vector_rpc_works_over_unix_and_ws() {
         )
         .unwrap_err();
     assert!(matches!(err, StoreError::Backend(_)), "{err}");
-    assert_eq!(client.read_state().unwrap().last_seq, seq);
+    assert_eq!(client.last_seq().unwrap(), seq);
 
     let bytes: Vec<u64> = 0.5f32
         .to_le_bytes()
@@ -3807,9 +3863,9 @@ fn vector_rpc_works_over_unix_and_ws() {
         .collect();
     assert_eq!(
         raw.call(
-            "commit_ops",
+            "commit_txn",
             json!({
-                "expected_seq": seq,
+                "reads": [],
                 "ops": [
                     {
                         "op": "upsert_vector",
@@ -3827,17 +3883,17 @@ fn vector_rpc_works_over_unix_and_ws() {
             }),
         )
         .unwrap(),
-        json!(true)
+        json!({"committed": true, "seq": seq + 1})
     );
     let (values, metadata) = client.get_vector("emb", "from-bytes").unwrap().unwrap();
     assert_eq!(values, vec![0.5, 0.25]);
     assert_eq!(metadata, Some(serde_json::Value::Null));
-    let seq = client.read_state().unwrap().last_seq;
+    let seq = client.last_seq().unwrap();
     assert_eq!(
         raw.call(
-            "commit_ops",
+            "commit_txn",
             json!({
-                "expected_seq": seq,
+                "reads": [],
                 "ops": [{
                     "op": "create_vector_collection",
                     "name": "extra",
@@ -3851,7 +3907,7 @@ fn vector_rpc_works_over_unix_and_ws() {
             }),
         )
         .unwrap(),
-        json!(true)
+        json!({"committed": true, "seq": seq + 1})
     );
     client
         .upsert_vector("extra", "q", &[1.0, -1.0], None)
@@ -3867,9 +3923,10 @@ fn vector_rpc_works_over_unix_and_ws() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("vecs.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
-    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    let client = connect_psk(&format!("ws://127.0.0.1:{port}")).unwrap();
     exercise_vector_rpc(&client, &file);
     let knowledge: Vec<KnowledgeHit> = client
         .search_knowledge(
@@ -4367,15 +4424,59 @@ fn l2_graph(order: &[&str]) -> super::vector::VectorCollection {
     }
 }
 
+/// The neighbor order is the full check's, not open's: `validate_graph` (what a snapshot
+/// decode runs) accepts a list out of (distance, id) order, `validate_graph_full` refuses it.
 #[test]
-fn validate_graph_rejects_neighbors_that_are_not_distance_then_id_ordered() {
-    let err = super::vector::validate_graph("emb", &l2_graph(&["m", "b", "a"])).unwrap_err();
-    assert!(matches!(err, StoreError::Backend(_)), "{err}");
-    assert!(err.to_string().contains("corrupt"), "{err}");
-    let err = super::vector::validate_graph("emb", &l2_graph(&["a", "b", "m"])).unwrap_err();
-    assert!(matches!(err, StoreError::Backend(_)), "{err}");
-    assert!(err.to_string().contains("corrupt"), "{err}");
-    super::vector::validate_graph("emb", &l2_graph(&["b", "m", "a"])).unwrap();
+fn the_full_check_rejects_neighbors_that_are_not_distance_then_id_ordered() {
+    for order in [&["m", "b", "a"][..], &["a", "b", "m"]] {
+        let graph = l2_graph(order);
+        super::vector::validate_graph("emb", &graph).unwrap();
+        let err = super::vector::validate_graph_full("emb", &graph).unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        assert!(err.to_string().contains("not ordered by distance"), "{err}");
+    }
+    super::vector::validate_graph_full("emb", &l2_graph(&["b", "m", "a"])).unwrap();
+}
+
+/// A CRC-valid snapshot whose only fault is a neighbor list out of canonical order decodes
+/// (open does not re-derive the order), the full check names the fault, and the encoder
+/// refuses to write it again.
+#[test]
+fn a_snapshot_decodes_a_misordered_neighbor_list_the_full_check_and_the_encoder_refuse_it() {
+    let vectors: super::state::Vectors = BTreeMap::from([(
+        "emb".to_string(),
+        std::sync::Arc::new(l2_graph(&["b", "m", "a"])),
+    )]);
+    let docs = super::state::Docs::default();
+    let tables = super::state::Tables::new();
+    let mut blob = layout::encode_snapshot_v3(1, &docs, &tables, &vectors).unwrap();
+    // `o`'s layer-0 list: a count of 3, then `b`, `m`, `a`, each length-prefixed.
+    let lp = |id: u8| [1, 0, 0, 0, id];
+    let list = |ids: [u8; 3]| -> Vec<u8> {
+        let mut out = vec![3, 0, 0, 0];
+        for id in ids {
+            out.extend_from_slice(&lp(id));
+        }
+        out
+    };
+    let canonical = list(*b"bma");
+    let at: Vec<usize> = (0..blob.len() - canonical.len())
+        .filter(|at| blob[*at..].starts_with(&canonical))
+        .collect();
+    assert_eq!(at.len(), 1, "one canonical list of three in the snapshot");
+    blob[at[0]..at[0] + canonical.len()].copy_from_slice(&list(*b"mba"));
+    let body = blob.len() - 4;
+    let crc = layout::crc32(&blob[..body]);
+    blob[body..].copy_from_slice(&crc.to_le_bytes());
+
+    let snap = layout::decode_snapshot(&blob).unwrap();
+    let col = &snap.vectors["emb"];
+    assert_eq!(col.vectors["o"].neighbors[0], ["m", "b", "a"]);
+    let err = super::vector::validate_graph_full("emb", col).unwrap_err();
+    assert!(err.to_string().contains("not ordered by distance"), "{err}");
+    let err = layout::encode_snapshot_v3(2, &docs, &tables, &snap.vectors).unwrap_err();
+    assert!(err.to_string().contains("not ordered by distance"), "{err}");
 }
 
 fn put_frame(seq: u64, id: &str) -> Vec<u8> {

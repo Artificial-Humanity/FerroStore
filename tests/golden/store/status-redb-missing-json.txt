@@ -1,0 +1,14 @@
+$ FL_STORE_BACKEND=redb fl store status --json
+exit: 0
+--- stdout
+{
+  "dead_bytes": null,
+  "engine": "redb",
+  "exists": false,
+  "format_version": null,
+  "live_bytes": null,
+  "logical_path": "<DIR>/stores/fl.redb",
+  "physical_path": "<DIR>/stores/fl.redb",
+  "size_bytes": null
+}
+--- stderr

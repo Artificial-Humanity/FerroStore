@@ -1,0 +1,5 @@
+$ fl store compact
+exit: 2
+--- stdout
+--- stderr
+error: no store at <DIR>/stores/fl.fls; `fl store compact` does not create one

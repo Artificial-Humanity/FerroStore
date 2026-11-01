@@ -8,7 +8,7 @@ use fl_core::log::{Attempt, GateRun};
 use fl_core::verdict::Verdict;
 use serde_json::{Number, Value, json};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 const CODEC_DELTA: u8 = 1;
 const CODEC_DELTA_RLE: u8 = 2;
@@ -253,13 +253,14 @@ pub(super) fn type_from_tag(tag: u8) -> Result<ColumnType, StoreError> {
     }
 }
 
+/// `taken`: a table named `name` already exists.
 pub(super) fn check_new_table(
-    tables: &BTreeMap<String, ColumnTable>,
+    taken: bool,
     name: &str,
     columns: &[ColumnDef],
 ) -> Result<(), StoreError> {
     check_name("table", name)?;
-    if tables.contains_key(name) {
+    if taken {
         return Err(backend(format!("column table `{name}` already exists")));
     }
     let mut seen = HashSet::new();
@@ -752,6 +753,12 @@ fn value_type(value: &ColumnValue) -> Option<ColumnType> {
         ColumnValue::Bytes(_) => Some(ColumnType::Bytes),
         ColumnValue::TimestampMs(_) => Some(ColumnType::TimestampMs),
     }
+}
+
+/// The rows one encoded row group holds: its leading count, read without
+/// decoding the group (for `ferrostore inspect`).
+pub(super) fn group_row_count(blob: &[u8]) -> Result<u64, StoreError> {
+    Ok(u64::from(Cur::new(blob).u32()?))
 }
 
 fn index_group<'a>(blob: &'a [u8], columns: &[ColumnDef]) -> Result<IndexedGroup<'a>, StoreError> {
@@ -1994,54 +2001,6 @@ fn json_u64(value: &Value, key: &str) -> Result<u64, StoreError> {
         .ok_or_else(|| backend(format!("missing integer field `{key}`")))
 }
 
-pub(super) fn tables_json(tables: &BTreeMap<String, ColumnTable>) -> Value {
-    Value::Array(
-        tables
-            .iter()
-            .map(|(name, table)| {
-                json!({
-                    "name": name,
-                    "columns": table.columns.iter().map(column_def_json).collect::<Vec<_>>(),
-                    "groups": table.groups.iter().map(|group| bytes_json(group)).collect::<Vec<_>>(),
-                })
-            })
-            .collect(),
-    )
-}
-
-pub(super) fn parse_tables(value: &Value) -> Result<BTreeMap<String, ColumnTable>, StoreError> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| backend("tables is not an array"))?;
-    let mut tables = BTreeMap::new();
-    for item in items {
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend("table is missing name"))?
-            .to_string();
-        let columns = parse_columns(
-            item.get("columns")
-                .ok_or_else(|| backend("table is missing columns"))?,
-        )?;
-        let groups_json = item
-            .get("groups")
-            .and_then(Value::as_array)
-            .ok_or_else(|| backend("table is missing groups"))?;
-        let mut groups = Vec::with_capacity(groups_json.len());
-        for group in groups_json {
-            groups.push(parse_bytes(group)?);
-        }
-        if tables
-            .insert(name.clone(), ColumnTable { columns, groups })
-            .is_some()
-        {
-            return Err(backend(format!("duplicate column table `{name}`")));
-        }
-    }
-    Ok(tables)
-}
-
 pub(super) fn parse_bytes(value: &Value) -> Result<Vec<u8>, StoreError> {
     let items = value
         .as_array()
@@ -2055,10 +2014,6 @@ pub(super) fn parse_bytes(value: &Value) -> Result<Vec<u8>, StoreError> {
         out.push(byte);
     }
     Ok(out)
-}
-
-fn bytes_json(bytes: &[u8]) -> Value {
-    Value::Array(bytes.iter().copied().map(Value::from).collect())
 }
 
 #[cfg(test)]

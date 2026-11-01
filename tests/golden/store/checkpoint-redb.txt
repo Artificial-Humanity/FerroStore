@@ -1,0 +1,5 @@
+$ FL_STORE_BACKEND=redb fl store checkpoint
+exit: 0
+--- stdout
+redb has no checkpoint; nothing to do
+--- stderr

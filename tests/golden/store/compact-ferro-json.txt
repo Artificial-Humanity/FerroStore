@@ -1,0 +1,20 @@
+$ fl store compact --json
+exit: 0
+--- stdout
+{
+  "after": {
+    "dead_bytes": 0,
+    "file_bytes": 9393,
+    "live_bytes": 9393
+  },
+  "before": {
+    "dead_bytes": 3093,
+    "file_bytes": 12486,
+    "live_bytes": 9393
+  },
+  "command": "compact",
+  "compacted": true,
+  "engine": "ferro",
+  "physical_path": "<DIR>/stores/fl.fls"
+}
+--- stderr

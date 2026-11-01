@@ -97,6 +97,87 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// The bytes of the secret file at `path` (a PSK, a token file), at most `max` of them. Refused,
+/// with the `chmod` that fixes it, when the file is not a regular file or its group or others have
+/// any permission bit: a secret others can read is no secret, and one they can write is not ours.
+/// Refused too when its owner is neither this process's effective uid nor root (a root-owned
+/// secret mount works): another user's file is not ours to trust, whatever its mode.
+/// The mode and the owner are read from the opened file, so the bytes read are the file that was
+/// checked.
+///
+/// A symlink is followed and its TARGET is checked: the checks run on the opened descriptor
+/// (`fstat`), so they apply to the final file with no window between check and read, and a
+/// symlinked secret (a Kubernetes secret volume, say) works. The open does not block
+/// (`O_NONBLOCK`): a FIFO or a device, also one a symlink points to, is opened without waiting
+/// for a writer and refused as not a regular file. On a regular file `O_NONBLOCK` changes
+/// nothing.
+pub(crate) fn read_secret_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let file = {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        owner_allowed(meta.uid(), euid, path)?;
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "it is mode {mode:03o}, so other users can reach it; refused: {}",
+                    fix_clause("chmod 600", path, "")
+                ),
+            ));
+        }
+    }
+    if meta.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it is larger than {max} bytes"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it is larger than {max} bytes"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Whether a secret file owned by `owner` may be read by a process whose effective uid is `euid`:
+/// its own files and root's. The error never holds the file's contents.
+#[cfg(unix)]
+fn owner_allowed(owner: u32, euid: u32, path: &Path) -> io::Result<()> {
+    if owner == euid || owner == 0 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is owned by uid {owner}, not by this process's uid {euid} or root; refused",
+            shown_path(path)
+        ),
+    ))
+}
+
 /// Paths already warned about in this process.
 static WARNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
@@ -273,7 +354,7 @@ fn shell_quote(s: &str) -> String {
 
 /// `path` as a shell word, or `None` when it cannot be pasted safely: not valid UTF-8 (the text
 /// would name a different path), or holding a character [`unsafe_char`] rejects.
-fn quoted_path(path: &Path) -> Option<String> {
+pub(crate) fn quoted_path(path: &Path) -> Option<String> {
     let s = path.to_str()?;
     (!s.chars().any(unsafe_char)).then(|| shell_quote(s))
 }
@@ -291,7 +372,7 @@ fn fix_clause(chmod: &str, path: &Path, lead: &str) -> String {
 
 /// `path` for the text of a warning: as is when it is safe to print, else debug-escaped (quoted,
 /// control characters and bytes that are not UTF-8 written as escapes).
-fn shown_path(path: &Path) -> String {
+pub(crate) fn shown_path(path: &Path) -> String {
     match quoted_path(path) {
         Some(_) => path.display().to_string(),
         None => format!("{path:?}"),
@@ -377,6 +458,22 @@ pub(crate) fn loose_warnings(
     }
 }
 
+/// Bytes a process that is not root can still write on the filesystem that holds `dir`
+/// (`statvfs`'s available blocks). For a command that is about to make a large copy there.
+// The `statvfs` fields are `u64` here and narrower on other targets.
+#[allow(clippy::useless_conversion)]
+pub fn available_bytes(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path holds a NUL byte"))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a NUL-terminated path and `stat` a writable, correctly sized buffer.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+}
+
 /// Write `text` and a newline to `w`, ignoring any error: a closed pipe (EPIPE) or a full disk on
 /// stderr must not turn a reminder into a panic or a failed command.
 fn write_line(w: &mut dyn Write, text: &str) {
@@ -397,6 +494,107 @@ pub fn warn_if_loose(store: &Path) {
         }
         #[cfg(not(test))]
         write_line(&mut std::io::stderr(), &text);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod secret_file_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// `read_secret_file` of `path` on its own thread: its answer, or a
+    /// panic when it gives none within 5 s (an open that blocked).
+    fn read_within(path: PathBuf) -> io::Result<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_secret_file(&path, 1024));
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("read_secret_file blocked on the path")
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("psk");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = read_within(fifo).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    fn secret(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let file = dir.join(name);
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        file
+    }
+
+    fn fifo_at(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn owner_decision_accepts_own_and_root_and_refuses_others() {
+        let path = Path::new("/run/secrets/psk");
+        assert!(owner_allowed(1000, 1000, path).is_ok());
+        assert!(owner_allowed(0, 1000, path).is_ok(), "root-owned mount");
+        assert!(owner_allowed(0, 0, path).is_ok());
+        assert!(
+            owner_allowed(1000, 0, path).is_err(),
+            "root trusts only its own"
+        );
+        let err = owner_allowed(1001, 1000, path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let text = err.to_string();
+        assert!(text.contains("/run/secrets/psk"), "{text}");
+        assert!(
+            text.contains("uid 1001") && text.contains("uid 1000"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_current_users_private_file_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret(dir.path(), "psk", 0o600);
+        assert_eq!(read_within(file).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn a_symlink_to_a_private_secret_is_followed_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret(dir.path(), "psk", 0o600);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(read_within(link).unwrap(), b"secret");
+        assert_eq!(read_within(file).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn a_symlink_to_a_loose_secret_is_refused_for_its_target_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret(dir.path(), "psk", 0o644);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let err = read_within(link).unwrap_err();
+        assert!(err.to_string().contains("mode 644"), "{err}");
+    }
+
+    #[test]
+    fn a_symlink_to_a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        fifo_at(&fifo);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let err = read_within(link).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 }
 
@@ -1233,5 +1431,12 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("nowhere.redb"), &dangling).unwrap();
         assert!(!create_private_file(&dangling).unwrap());
         assert!(!tmp.path().join("nowhere.redb").exists());
+    }
+
+    #[test]
+    fn available_bytes_reports_the_free_space_of_a_directory_and_fails_on_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(available_bytes(tmp.path()).unwrap() > 0);
+        assert!(available_bytes(&tmp.path().join("missing")).is_err());
     }
 }

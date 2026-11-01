@@ -1,0 +1,7 @@
+$ fl store compact
+exit: 0
+--- stdout
+compacted <DIR>/stores/fl.fls
+file bytes: 12486 -> 9393
+dead bytes: 3093 -> 0
+--- stderr

@@ -1,0 +1,602 @@
+$ fl store migrate --json
+exit: 0
+--- stdout
+{
+  "clean": true,
+  "command": "migrate",
+  "dry_run": false,
+  "elapsed_ms": <T>,
+  "fls": "<DIR>/stores/fl.fls",
+  "mismatches": [],
+  "redb": "<DIR>/stores/fl.redb",
+  "redb_kept_read_only": true,
+  "tables": [
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#1>",
+      "ferro_rows": 1,
+      "name": "meta",
+      "redb_hash": "<HASH#1>",
+      "redb_rows": 1
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#2>",
+      "ferro_rows": 2,
+      "name": "ids",
+      "redb_hash": "<HASH#2>",
+      "redb_rows": 2
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "aliases",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#4>",
+      "ferro_rows": 2,
+      "name": "handles",
+      "redb_hash": "<HASH#4>",
+      "redb_rows": 2
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#5>",
+      "ferro_rows": 2,
+      "name": "handle_of",
+      "redb_hash": "<HASH#5>",
+      "redb_rows": 2
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#6>",
+      "ferro_rows": 2,
+      "name": "projects",
+      "redb_hash": "<HASH#6>",
+      "redb_rows": 2
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "gates",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "transitions",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "records",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "findings",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "gate_runs",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "attempts",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "imports",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "github_bindings",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ledger_published",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ledger_cutovers",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ledger_candidate_runs",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ledger_candidate_attempts",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ledger_roots",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ledger_heads",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ledger_segments",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "routing",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "escalating",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "tombstones",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "state_entries",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "state_keys",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "state_revisions",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "state_revision_ids",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "state_conflicts",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "state_sync_cursors",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "agents",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "agent_by_name",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "areas",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "agent_events",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "agent_event_ids",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "wire_messages",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "wire_msg_log",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "wire_msg_seq",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "wire_inbox",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "wire_rcpt_log",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "wire_threads",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "wire_replies",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "workflow_defs",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "workflow_slugs",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "workflow_runs",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#7>",
+      "ferro_rows": 1,
+      "name": "__meta",
+      "redb_hash": "<HASH#7>",
+      "redb_rows": 1
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "ferrostore:unlisted",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    }
+  ],
+  "trait_views": [
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#8>",
+      "ferro_rows": 2,
+      "name": "Catalog::list_projects",
+      "redb_hash": "<HASH#8>",
+      "redb_rows": 2
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Catalog::list_gates(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Catalog::list_transitions(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Tracker::list_records(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Tracker::list_findings(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Ledger::attempts(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "WorkflowStore::list_workflow_defs(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "WorkflowStore::list_workflow_runs(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Catalog::list_gates(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Catalog::list_transitions(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Tracker::list_records(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Tracker::list_findings(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "Ledger::attempts(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "WorkflowStore::list_workflow_defs(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "WorkflowStore::list_workflow_runs(urn:uuid:<UUID>)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "AgentRegistry::list_areas",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "AgentRegistry::list_agents(all)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "AgentRegistry::registry_events_after(0)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "StateStore::list_state(all)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "StateStore::list_conflicts",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "StateStore::state_revisions_after(0)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "MessageStore::list_wire_inbox(all)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "MessageStore::wire_messages_after(0)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "MessageStore::wire_receipts_after(0)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "WorkflowStore::list_workflow_defs(all)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#3>",
+      "ferro_rows": 0,
+      "name": "WorkflowStore::list_workflow_runs(all)",
+      "redb_hash": "<HASH#3>",
+      "redb_rows": 0
+    }
+  ]
+}
+--- stderr

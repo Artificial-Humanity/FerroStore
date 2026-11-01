@@ -3,12 +3,16 @@
 //! A value redb stored with `serde_json::to_string` is parsed back to that
 //! value. A raw `&str` is stored as a JSON string and is not parsed:
 //! `from_str("1")` would turn a numeric token into a number.
+//!
+//! redb's `meta.format_version` is the schema version. It is written to
+//! `("__meta", "schema_version")`, not to the `meta` collection, so the store
+//! has one version and it is the source's.
 
 use super::doc::{self, key_u64, pair, pair_u64, triple};
 use super::{FerroStore, Txn};
 use crate::{RedbStore, backend, decode};
 use fl_core::StoreError;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 use serde_json::Value;
 
 macro_rules! copy_rows {
@@ -27,7 +31,13 @@ macro_rules! copy_rows {
 
 pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Result<(), StoreError> {
     ferro.with_write(|txn| {
-        if !txn.docs.is_empty() || !txn.tables.is_empty() || !txn.vectors.is_empty() {
+        // A new store's own schema document is not data: it is overwritten below.
+        // The body has staged nothing yet, so the base is the whole view.
+        let holds_data = txn
+            .collections()
+            .iter()
+            .any(|collection| collection != doc::SCHEMA_COLLECTION);
+        if holds_data || txn.has_tables() || txn.has_vectors() {
             return Err(backend(
                 "refusing to migrate into a FerroStore that already holds a document, a column table, or a vector collection",
             ));
@@ -39,11 +49,27 @@ pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Resul
 fn copy_tables(redb: &RedbStore, txn: &mut Txn) -> Result<(), StoreError> {
     let tx = redb.db.begin_read().map_err(backend)?;
 
+    let mut schema = None;
     copy_rows!(
         tx,
         TableDefinition::<&str, u64>::new(doc::META),
-        |key, value| { doc::put_json(txn, doc::META, key, &value) }
+        |key, value| {
+            if key == doc::FORMAT_KEY {
+                schema = Some(value);
+                Ok(())
+            } else {
+                doc::put_json(txn, doc::META, key, &value)
+            }
+        }
     );
+    match schema {
+        Some(version) => doc::put_json(txn, doc::SCHEMA_COLLECTION, doc::SCHEMA_KEY, &version)?,
+        None => {
+            if txn.get(doc::SCHEMA_COLLECTION, doc::SCHEMA_KEY).is_some() {
+                txn.delete(doc::SCHEMA_COLLECTION, doc::SCHEMA_KEY);
+            }
+        }
+    }
     copy_rows!(
         tx,
         TableDefinition::<&str, &str>::new(doc::IDS),

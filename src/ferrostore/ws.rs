@@ -8,10 +8,14 @@ use super::layout::backend;
 use fl_core::StoreError;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 pub(super) const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+/// The largest upgrade request or response, headers included.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// The end of an HTTP header block.
+const HEADER_END: &[u8; 4] = b"\r\n\r\n";
 
 const OP_TEXT: u8 = 0x1;
 const OP_BINARY: u8 = 0x2;
@@ -31,33 +35,80 @@ struct RawFrame {
     payload: Vec<u8>,
 }
 
-pub(super) fn connect(rest: &str) -> Result<TcpStream, StoreError> {
-    let (host_port, path) = split_target(rest)?;
-    let mut stream = TcpStream::connect(host_port)
+/// Connect to `rest` (`host:port[/path]`) and upgrade. `bearer` is sent as
+/// `Authorization: Bearer <token>`; the caller has checked that it is
+/// visible ASCII, so it cannot end the header. `admit` is given the address
+/// actually connected to before anything is written, and may refuse it.
+#[cfg(test)]
+pub(super) fn connect(
+    rest: &str,
+    bearer: Option<&str>,
+    admit: impl FnOnce(SocketAddr) -> Result<(), StoreError>,
+) -> Result<TcpStream, StoreError> {
+    let (host_port, path) = split_target("ws", rest)?;
+    check_bearer(bearer)?;
+    let (mut stream, peer) = dial(host_port)?;
+    admit(peer)?;
+    upgrade(&mut stream, host_port, &path, bearer)?;
+    Ok(stream)
+}
+
+/// `Err` unless `bearer` is absent or visible ASCII without spaces.
+pub(super) fn check_bearer(bearer: Option<&str>) -> Result<(), StoreError> {
+    if bearer.is_some_and(|token| token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        return Err(backend("a bearer token is visible ASCII without spaces"));
+    }
+    Ok(())
+}
+
+/// The TCP connection to `host_port`, with no delay, and the address it
+/// reached.
+pub(super) fn dial(host_port: &str) -> Result<(TcpStream, SocketAddr), StoreError> {
+    let stream = TcpStream::connect(host_port)
         .map_err(|err| backend(format!("connect {host_port}: {err}")))?;
+    let peer = stream
+        .peer_addr()
+        .map_err(|err| backend(format!("peer address of {host_port}: {err}")))?;
     stream
         .set_nodelay(true)
         .map_err(|err| backend(format!("set nodelay: {err}")))?;
+    Ok((stream, peer))
+}
+
+/// Send the upgrade request for `path` on `stream` and check the answer.
+pub(super) fn upgrade<S: Read + Write>(
+    stream: &mut S,
+    host_port: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> Result<(), StoreError> {
+    check_bearer(bearer)?;
     let mut key_bytes = [0u8; 16];
     random_bytes(&mut key_bytes)?;
     let sec_key = base64_encode(&key_bytes);
+    let authorization = bearer.map_or_else(String::new, |token| {
+        format!("Authorization: Bearer {token}\r\n")
+    });
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_port}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {sec_key}\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n"
+         Sec-WebSocket-Version: 13\r\n\
+         {authorization}\r\n"
     );
     stream
         .write_all(req.as_bytes())
         .map_err(|err| backend(format!("write handshake: {err}")))?;
-    let headers = read_headers(&mut stream)?;
-    check_accept(&headers, &sec_key)?;
-    Ok(stream)
+    let headers = read_headers(stream)?;
+    check_accept(&headers, &sec_key)
 }
 
-pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
+/// Read and answer the client's upgrade. Returns the values of its
+/// `Authorization` headers, for the caller to judge (spec §6.2).
+pub(super) fn accept<S: Read + Write>(stream: &mut S) -> Result<Vec<String>, StoreError> {
     let text = read_headers(stream)?;
     let mut lines = text.split("\r\n");
     let start = lines.next().unwrap_or("");
@@ -69,6 +120,7 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
     let mut connection = false;
     let mut version = false;
     let mut key = None;
+    let mut authorization = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
@@ -87,6 +139,8 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
             version = value == "13";
         } else if name.trim().eq_ignore_ascii_case("sec-websocket-key") && !value.is_empty() {
             key = Some(value.to_string());
+        } else if name.trim().eq_ignore_ascii_case("authorization") {
+            authorization.push(value.to_string());
         }
     }
     let Some(key) = key else {
@@ -105,12 +159,18 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
     stream
         .write_all(resp.as_bytes())
         .map_err(|err| backend(format!("write handshake: {err}")))?;
-    Ok(())
+    Ok(authorization)
 }
 
-pub(super) fn read_event(stream: &mut TcpStream, client: bool) -> Result<WsEvent, StoreError> {
+/// The next data frame, ping or close. A frame that declares a payload
+/// longer than `max_len` is refused before anything is allocated for it.
+pub(super) fn read_event<S: Read>(
+    stream: &mut S,
+    client: bool,
+    max_len: usize,
+) -> Result<WsEvent, StoreError> {
     loop {
-        let frame = read_raw(stream, client)?;
+        let frame = read_raw(stream, client, max_len)?;
         match frame.opcode {
             OP_TEXT | OP_BINARY => return Ok(WsEvent::Data(frame.payload)),
             OP_PING => return Ok(WsEvent::Ping(frame.payload)),
@@ -123,8 +183,8 @@ pub(super) fn read_event(stream: &mut TcpStream, client: bool) -> Result<WsEvent
     }
 }
 
-pub(super) fn write_frame(
-    stream: &mut TcpStream,
+pub(super) fn write_frame<S: Write>(
+    stream: &mut S,
     client: bool,
     opcode: u8,
     payload: &[u8],
@@ -162,7 +222,19 @@ pub(super) fn write_frame(
     Ok(())
 }
 
-fn read_raw(stream: &mut TcpStream, client: bool) -> Result<RawFrame, StoreError> {
+/// The error of a frame longer than `max_len` (at most [`MAX_PAYLOAD`]).
+pub(super) fn too_long(max_len: usize) -> StoreError {
+    if max_len >= MAX_PAYLOAD {
+        backend("frame length is outside 1..=16MiB")
+    } else {
+        backend(format!(
+            "frame length is over {max_len} bytes, the limit before authentication"
+        ))
+    }
+}
+
+fn read_raw<S: Read>(stream: &mut S, client: bool, max_len: usize) -> Result<RawFrame, StoreError> {
+    let max_len = max_len.min(MAX_PAYLOAD);
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr).map_err(backend)?;
     if hdr[0] & 0x70 != 0 {
@@ -188,8 +260,8 @@ fn read_raw(stream: &mut TcpStream, client: bool) -> Result<RawFrame, StoreError
         stream.read_exact(&mut ext).map_err(backend)?;
         len = u64::from_be_bytes(ext);
     }
-    if len > MAX_PAYLOAD as u64 {
-        return Err(backend("frame length is outside 1..=16MiB"));
+    if len > max_len as u64 {
+        return Err(too_long(max_len));
     }
     let control = opcode >= OP_CLOSE;
     if control && (!fin || len > 125) {
@@ -215,17 +287,24 @@ fn read_raw(stream: &mut TcpStream, client: bool) -> Result<RawFrame, StoreError
     Ok(RawFrame { opcode, payload })
 }
 
-fn split_target(rest: &str) -> Result<(&str, String), StoreError> {
+/// `rest` (`host:port[/path]`) as its `host:port` and its path (`/` when
+/// none). `scheme` (`ws` or `wss`) names the URI in an error.
+pub(super) fn split_target<'a>(
+    scheme: &str,
+    rest: &'a str,
+) -> Result<(&'a str, String), StoreError> {
     if rest.is_empty() {
-        return Err(backend("ws uri is missing a host"));
+        return Err(backend(format!("{scheme} uri is missing a host")));
     }
     let (host_port, path) = match rest.find('/') {
-        Some(0) => return Err(backend("ws uri is missing a host")),
+        Some(0) => return Err(backend(format!("{scheme} uri is missing a host"))),
         Some(index) => (&rest[..index], rest[index..].to_string()),
         None => (rest, "/".to_string()),
     };
     if !host_has_port(host_port) {
-        return Err(backend(format!("ws uri `{host_port}` is missing a port")));
+        return Err(backend(format!(
+            "{scheme} uri `{host_port}` is missing a port"
+        )));
     }
     Ok((host_port, path))
 }
@@ -260,22 +339,37 @@ fn header_has_token(value: &str, token: &str) -> bool {
         .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
-fn read_headers(stream: &mut TcpStream) -> Result<String, StoreError> {
+/// The upgrade's header block, up to [`MAX_HEADER_BYTES`], and not one
+/// byte past its end: the frames that follow stay in the stream. Each read
+/// asks for as many bytes as cannot reach past the end (up to 4), not one
+/// at a time. The server bounds the whole handshake in time
+/// ([`super::auth::HANDSHAKE_DEADLINE`]), so a peer that trickles is cut off.
+fn read_headers<S: Read>(stream: &mut S) -> Result<String, StoreError> {
     let mut buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    while buf.len() < 16 * 1024 {
+    let mut chunk = [0u8; HEADER_END.len()];
+    while buf.len() < MAX_HEADER_BYTES {
+        let want = safe_read_len(&buf).min(MAX_HEADER_BYTES - buf.len());
         let n = stream
-            .read(&mut byte)
+            .read(&mut chunk[..want])
             .map_err(|err| backend(format!("read handshake: {err}")))?;
         if n == 0 {
             return Err(backend("websocket handshake ended before the headers"));
         }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.ends_with(HEADER_END) {
             return String::from_utf8(buf).map_err(|_| backend("websocket handshake is not utf-8"));
         }
     }
     Err(backend("websocket handshake headers are too large"))
+}
+
+/// The most bytes that can follow `buf` without reaching past the first
+/// [`HEADER_END`]: 4 less the longest end of `buf` that begins it.
+fn safe_read_len(buf: &[u8]) -> usize {
+    (1..HEADER_END.len())
+        .rev()
+        .find(|&k| buf.ends_with(&HEADER_END[..k]))
+        .map_or(HEADER_END.len(), |k| HEADER_END.len() - k)
 }
 
 fn check_accept(text: &str, sec_key: &str) -> Result<(), StoreError> {
@@ -460,30 +554,32 @@ mod tests {
             stream.set_nodelay(true).unwrap();
             accept(&mut stream).unwrap();
             for expected in [4usize, 200, 70_000] {
-                let WsEvent::Data(payload) = read_event(&mut stream, false).unwrap() else {
+                let WsEvent::Data(payload) = read_event(&mut stream, false, MAX_PAYLOAD).unwrap()
+                else {
                     panic!("expected a data frame");
                 };
                 assert_eq!(payload.len(), expected);
                 assert!(payload.iter().all(|byte| *byte == b'z'));
                 write_frame(&mut stream, false, OP_TEXT, &payload).unwrap();
             }
-            let WsEvent::Ping(payload) = read_event(&mut stream, false).unwrap() else {
+            let WsEvent::Ping(payload) = read_event(&mut stream, false, MAX_PAYLOAD).unwrap()
+            else {
                 panic!("expected a ping");
             };
             assert_eq!(payload, b"xyz");
             write_frame(&mut stream, false, OP_PONG, &payload).unwrap();
         });
-        let mut client = connect(&format!("{addr}/store")).unwrap();
+        let mut client = connect(&format!("{addr}/store"), None, |_| Ok(())).unwrap();
         for size in [4usize, 200, 70_000] {
             let payload = vec![b'z'; size];
             write_frame(&mut client, true, OP_BINARY, &payload).unwrap();
-            let WsEvent::Data(got) = read_event(&mut client, true).unwrap() else {
+            let WsEvent::Data(got) = read_event(&mut client, true, MAX_PAYLOAD).unwrap() else {
                 panic!("expected echoed data");
             };
             assert_eq!(got, payload);
         }
         write_frame(&mut client, true, OP_PING, b"xyz").unwrap();
-        let pong = read_raw(&mut client, true).unwrap();
+        let pong = read_raw(&mut client, true, MAX_PAYLOAD).unwrap();
         assert_eq!(pong.opcode, OP_PONG);
         assert_eq!(pong.payload, b"xyz");
         drop(client);
@@ -497,15 +593,75 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             accept(&mut stream).unwrap();
-            let err = read_event(&mut stream, false).unwrap_err();
+            let err = read_event(&mut stream, false, MAX_PAYLOAD).unwrap_err();
             assert!(err.to_string().contains("16MiB"), "{err}");
         });
-        let mut client = connect(&format!("{addr}")).unwrap();
+        let mut client = connect(&format!("{addr}"), None, |_| Ok(())).unwrap();
         let mut hdr = vec![0x82, 0x80 | 127];
         hdr.extend_from_slice(&u64::try_from(MAX_PAYLOAD + 1).unwrap().to_be_bytes());
         hdr.extend_from_slice(&[1, 2, 3, 4]);
         client.write_all(&hdr).unwrap();
         drop(client);
         server.join().unwrap();
+    }
+
+    /// A frame that declares more than the reader's limit is refused from
+    /// its header: the reader does not wait for, or allocate, the payload.
+    #[test]
+    fn a_frame_over_the_callers_limit_is_refused_from_its_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        // 1 MiB declared, mask sent, no payload: a reader that allocated and
+        // waited would block here until its timeout.
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut hdr = vec![0x82, 0x80 | 127];
+        hdr.extend_from_slice(&(1u64 << 20).to_be_bytes());
+        hdr.extend_from_slice(&[1, 2, 3, 4]);
+        client.write_all(&hdr).unwrap();
+        let started = std::time::Instant::now();
+        let err = read_event(&mut server, false, 4096).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("over 4096 bytes, the limit before authentication"),
+            "{err}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // At the limit is fine (on a new connection: the refused frame's
+        // mask is still in this one).
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let payload = vec![b'x'; 4096];
+        write_frame(&mut client, true, OP_BINARY, &payload).unwrap();
+        let WsEvent::Data(got) = read_event(&mut server, false, 4096).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(got.len(), 4096);
+    }
+
+    #[test]
+    fn a_header_read_never_reaches_past_the_end_of_the_headers() {
+        assert_eq!(safe_read_len(b""), 4);
+        assert_eq!(safe_read_len(b"GET /"), 4);
+        assert_eq!(safe_read_len(b"x\r"), 3);
+        assert_eq!(safe_read_len(b"x\r\n"), 2);
+        assert_eq!(safe_read_len(b"x\r\n\r"), 1);
+        assert_eq!(safe_read_len(b"x\r\r"), 3);
+        // The bytes after the headers are left for the frame reader.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nAFTER")
+            .unwrap();
+        let headers = read_headers(&mut server).unwrap();
+        assert!(headers.ends_with("Host: x\r\n\r\n"), "{headers:?}");
+        let mut rest = [0u8; 5];
+        server.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"AFTER");
     }
 }

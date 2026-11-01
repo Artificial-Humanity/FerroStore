@@ -8,7 +8,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-/// One committed mutation, in the same shape `commit_ops` carries.
+/// One committed mutation, in the shape of an [`Op`] a commit carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SyncOp {
@@ -193,6 +193,16 @@ pub enum SyncMode {
 pub trait SyncAdapter: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Receive one committed batch. In `WriteThrough` the commit is durable
+    /// before this runs, and the committer waits for it: an `Err` makes the
+    /// write return [`StoreError::Undelivered`] and leaves the batch pending.
+    ///
+    /// ⚠ An `on_commit` that blocks waiting for a commit made on another
+    /// thread through the same handle deadlocks under `WriteThrough`: that
+    /// commit waits for this call to return before its own batch can be
+    /// sent. For example, an HTTP adapter pointed back at a server that
+    /// writes to the same handle. A commit made on this call's own thread
+    /// does not wait: it stays queued.
     fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError>;
 
     fn pull_since(&self, _after_seq: u64) -> Result<Vec<SyncBatch>, StoreError> {
@@ -1026,7 +1036,7 @@ mod tests {
         let (store, fake) = attach(SyncMode::WriteThrough);
         fake.fail.store(true, Ordering::SeqCst);
         let err = store.put_doc("docs", "a", &json!({"n": 1})).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)));
+        assert!(matches!(err, StoreError::Undelivered { seq: 1, .. }));
         assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
         assert!(fake.commits().is_empty());
         assert_eq!(store.synced_seq(), 0);
@@ -1199,38 +1209,47 @@ mod tests {
     }
 
     #[test]
-    fn failed_write_through_queues_the_next_commit_until_flush() {
+    fn a_failed_write_through_batch_is_sent_first_by_the_next_commit() {
         let (store, fake) = attach(SyncMode::WriteThrough);
         fake.fail.store(true, Ordering::SeqCst);
         let err = store.put_doc("docs", "a", &json!({"n": 1})).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert!(
+            matches!(err, StoreError::Undelivered { seq: 1, .. }),
+            "{err}"
+        );
         assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
         assert!(fake.commits().is_empty());
         assert_eq!(store.synced_seq(), 0);
+        assert!(store.has_pending_sync(), "the failed batch stays queued");
 
-        fake.fail.store(false, Ordering::SeqCst);
-        store.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        // While the adapter still fails, the next commit is durable and
+        // returns the adapter's error: its batch is queued behind the first.
+        let err = store.put_doc("docs", "b", &json!({"n": 2})).unwrap_err();
         assert!(
-            fake.commits().is_empty(),
-            "a later commit is queued, not delivered"
+            matches!(err, StoreError::Undelivered { seq: 2, .. }),
+            "{err}"
         );
         assert_eq!(store.get_doc("docs", "b").unwrap(), Some(json!({"n": 2})));
-        assert_eq!(store.synced_seq(), 0);
+        assert!(fake.commits().is_empty());
 
-        assert_eq!(store.sync_flush().unwrap(), 2);
+        // The next commit sends the queue, oldest first, then its own batch.
+        fake.fail.store(false, Ordering::SeqCst);
+        store.put_doc("docs", "b2", &json!({"n": 3})).unwrap();
         assert_eq!(
             fake.commits()
                 .iter()
                 .map(|batch| batch.seq)
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![1, 2, 3]
         );
-        assert_eq!(store.synced_seq(), 2);
-
-        store.put_doc("docs", "c", &json!({"n": 3})).unwrap();
-        assert_eq!(fake.commits().len(), 3);
-        assert_eq!(fake.commits()[2].seq, 3);
         assert_eq!(store.synced_seq(), 3);
+        assert!(!store.has_pending_sync());
+        assert_eq!(store.sync_flush().unwrap(), 3);
+
+        store.put_doc("docs", "c", &json!({"n": 4})).unwrap();
+        assert_eq!(fake.commits().len(), 4);
+        assert_eq!(fake.commits()[3].seq, 4);
+        assert_eq!(store.synced_seq(), 4);
     }
 
     struct HoldFirst {
@@ -1263,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn write_through_in_flight_queues_the_next_commit() {
+    fn write_through_in_flight_holds_the_next_commit_until_its_batch_is_sent() {
         let entered = Arc::new((Mutex::new(false), Condvar::new()));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let adapter = Arc::new(HoldFirst {
@@ -1290,7 +1309,21 @@ mod tests {
                 guard = cv.wait(guard).unwrap();
             }
         }
-        store.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        let second = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "b", &json!({"n": 2})).unwrap())
+        };
+        // The second commit is applied but waits out the first notify.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while store.read_state().unwrap().last_seq < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second commit did not apply"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!second.is_finished(), "returned before its batch was sent");
         assert!(adapter.commits.lock().unwrap().is_empty());
         {
             let (lock, cv) = &*release;
@@ -1298,11 +1331,10 @@ mod tests {
             cv.notify_all();
         }
         worker.join().unwrap();
-        assert_eq!(adapter.commits.lock().unwrap().as_slice(), &[1]);
-        assert_eq!(store.synced_seq(), 1);
-        assert_eq!(store.sync_flush().unwrap(), 2);
+        second.join().unwrap();
         assert_eq!(adapter.commits.lock().unwrap().as_slice(), &[1, 2]);
         assert_eq!(store.synced_seq(), 2);
+        assert!(!store.has_pending_sync());
     }
 
     struct BlockingNotify {
@@ -1388,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn write_through_second_put_returns_while_the_first_notify_is_blocked() {
+    fn write_through_second_put_returns_only_after_the_first_notify_and_its_own() {
         let BlockingRig {
             adapter,
             entered,
@@ -1407,11 +1439,23 @@ mod tests {
             thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})).unwrap())
         };
         wait_flag(&entered);
+        let early = Arc::clone(&adapter.early);
         let second = {
             let store = Arc::clone(&store);
             thread::spawn(move || store.put_doc("docs", "b", &json!({"n": 2})).unwrap())
         };
-        second.join().unwrap();
+        {
+            let (lock, cv) = &*early;
+            let guard = lock.lock().unwrap();
+            let (guard, status) = cv
+                .wait_timeout(guard, std::time::Duration::from_millis(250))
+                .unwrap();
+            assert!(
+                status.timed_out() && !*guard,
+                "the second commit called on_commit while the first was in flight"
+            );
+        }
+        assert!(!second.is_finished(), "returned before its batch was sent");
         assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1]);
         {
             let (lock, cv) = &*release;
@@ -1419,15 +1463,14 @@ mod tests {
             cv.notify_all();
         }
         first.join().unwrap();
-        assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1]);
-        assert_eq!(store.synced_seq(), 1);
-        assert_eq!(store.sync_flush().unwrap(), 2);
+        second.join().unwrap();
         assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1, 2]);
         assert_eq!(store.synced_seq(), 2);
+        assert!(!store.has_pending_sync());
     }
 
     #[test]
-    fn sync_flush_waits_out_a_blocked_notify_and_then_sends_the_failed_batch_first() {
+    fn a_queued_commit_waits_out_a_blocked_notify_and_then_sends_the_failed_batch_first() {
         let BlockingRig {
             adapter,
             entered,
@@ -1447,12 +1490,11 @@ mod tests {
             thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})))
         };
         wait_flag(&entered);
+        // The second commit queues behind the in-flight notify and drains.
         let second = {
             let store = Arc::clone(&store);
             thread::spawn(move || store.put_doc("docs", "b", &json!({"n": 2})).unwrap())
         };
-        second.join().unwrap();
-        assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1]);
         let flushed = {
             let store = Arc::clone(&store);
             thread::spawn(move || store.sync_flush())
@@ -1465,16 +1507,21 @@ mod tests {
                 .unwrap();
             assert!(
                 status.timed_out() && !*guard,
-                "flush called on_commit while an older notify was still in flight"
+                "a drain or flush called on_commit while an older notify was still in flight"
             );
         }
+        assert!(!second.is_finished(), "returned before its batch was sent");
         {
             let (lock, cv) = &*release;
             *lock.lock().unwrap() = true;
             cv.notify_all();
         }
         let err = first.join().unwrap().unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert!(
+            matches!(err, StoreError::Undelivered { seq: 1, .. }),
+            "{err}"
+        );
+        second.join().unwrap();
         assert_eq!(flushed.join().unwrap().unwrap(), 2);
         assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1, 1, 2]);
         assert_eq!(store.synced_seq(), 2);

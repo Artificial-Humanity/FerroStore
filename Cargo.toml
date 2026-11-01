@@ -9,16 +9,37 @@ repository = "https://github.com/Artificial-Humanity/FerroStore"
 
 [dependencies]
 # Pinned to a FerroLoop commit: see the README ("Why fl-core is pinned").
-fl-core = { git = "https://github.com/Artificial-Humanity/FerroLoop.git", rev = "af85c42feb097fa2e1e483391c774a2044dfce0c" }
+fl-core = { git = "https://github.com/Artificial-Humanity/FerroLoop.git", rev = "2573b2ad01ed8a8ed45fe37f07d4aa5403ca439c" }
 redb = "4.3.0"
+thiserror = "2.0.20"
 serde = { version = "1.0.229", features = ["derive"] }
 # Never enable `preserve_order` on serde_json: some FerroLoop layers re-encode
 # JSON and need a `Value`'s keys sorted.
 serde_json = "1.0.151"
-sha2 = "0.10"
-thiserror = "2.0.20"
 uuid = { version = "1.26", features = ["v7"] }
+sha2 = "0.10"
+ring = "0.17"
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0"
+zeroize = "1.9"
+clap = { version = "4.6.7", features = ["derive"], optional = true }
+
+[features]
+# The `ferrostore` binary and the shared clap arguments in `fl_store::cli::args`.
+# On by default; a library consumer that needs neither can turn it off.
+default = ["cli"]
+cli = ["dep:clap"]
+
+[[bin]]
+name = "ferrostore"
+path = "src/bin/ferrostore.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "ferrostore_bin"
+required-features = ["cli"]
 
 [dev-dependencies]
-fl-core = { git = "https://github.com/Artificial-Humanity/FerroLoop.git", rev = "af85c42feb097fa2e1e483391c774a2044dfce0c", features = ["conformance"] }
 tempfile = "3.27.0"
+fl-core = { git = "https://github.com/Artificial-Humanity/FerroLoop.git", rev = "2573b2ad01ed8a8ed45fe37f07d4aa5403ca439c", features = ["conformance"] }

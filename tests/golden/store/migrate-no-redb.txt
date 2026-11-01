@@ -1,0 +1,5 @@
+$ fl store migrate
+exit: 2
+--- stdout
+--- stderr
+error: no redb store at <DIR>/stores/fl.redb; `fl store migrate` does not create one

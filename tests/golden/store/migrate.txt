@@ -1,0 +1,56 @@
+$ fl store migrate
+exit: 0
+--- stdout
+migrate <DIR>/stores/fl.redb -> <DIR>/stores/fl.fls
+table                            redb       ferro  status
+meta                                1           1  ok
+ids                                 2           2  ok
+aliases                             0           0  ok
+handles                             2           2  ok
+handle_of                           2           2  ok
+projects                            2           2  ok
+gates                               0           0  ok
+transitions                         0           0  ok
+records                             0           0  ok
+findings                            0           0  ok
+gate_runs                           0           0  ok
+attempts                            0           0  ok
+imports                             0           0  ok
+github_bindings                     0           0  ok
+ledger_published                    0           0  ok
+ledger_cutovers                     0           0  ok
+ledger_candidate_runs               0           0  ok
+ledger_candidate_attempts           0           0  ok
+ledger_roots                        0           0  ok
+ledger_heads                        0           0  ok
+ledger_segments                     0           0  ok
+routing                             0           0  ok
+escalating                          0           0  ok
+tombstones                          0           0  ok
+state_entries                       0           0  ok
+state_keys                          0           0  ok
+state_revisions                     0           0  ok
+state_revision_ids                  0           0  ok
+state_conflicts                     0           0  ok
+state_sync_cursors                  0           0  ok
+agents                              0           0  ok
+agent_by_name                       0           0  ok
+areas                               0           0  ok
+agent_events                        0           0  ok
+agent_event_ids                     0           0  ok
+wire_messages                       0           0  ok
+wire_msg_log                        0           0  ok
+wire_msg_seq                        0           0  ok
+wire_inbox                          0           0  ok
+wire_rcpt_log                       0           0  ok
+wire_threads                        0           0  ok
+wire_replies                        0           0  ok
+workflow_defs                       0           0  ok
+workflow_slugs                      0           0  ok
+workflow_runs                       0           0  ok
+__meta                              1           1  ok
+ferrostore:unlisted                 0           0  ok
+views: 26 compared, 0 differ
+time: <T>s
+clean: <DIR>/stores/fl.fls is the store; <DIR>/stores/fl.redb is kept, read-only (0400)
+--- stderr

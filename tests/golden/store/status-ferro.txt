@@ -1,0 +1,12 @@
+$ fl store status
+exit: 0
+--- stdout
+engine:         ferro
+logical path:   <DIR>/stores/fl.redb
+physical path:  <DIR>/stores/fl.fls
+exists:         yes
+size:           12486 bytes
+live:           9393 bytes
+dead:           3093 bytes (`fl store compact` gives them back)
+format version: n/a (not available on ferro yet)
+--- stderr

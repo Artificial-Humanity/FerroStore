@@ -16,7 +16,7 @@ use fl_core::state::{
     lowest_common_ancestor_in_dag, sorted_parents, validate_slug,
 };
 use fl_core::store::{AgentRegistry, StateStore, StoreError};
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::{
     ALIASES, FORMAT_WITH_STATE, HANDLE_OF, HANDLES, IDS, META, RedbStore, additive, backend,

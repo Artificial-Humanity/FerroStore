@@ -1,0 +1,5 @@
+$ fl store checkpoint
+exit: 0
+--- stdout
+checkpointed <DIR>/stores/fl.fls
+--- stderr
