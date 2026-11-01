@@ -1,0 +1,6 @@
+These certificates and this private key are public, test-only fixtures made
+for the FerroStore TLS test suite: the key is published in this repository,
+so anyone can impersonate a server that uses it. Never deploy any of them,
+and never trust ca.pem or other-ca.pem outside the tests. They were made
+once with OpenSSL 3.5 (the CA keys were discarded); the exact commands are
+in the module comment at the top of src/ferrostore/tests_tls.rs.

@@ -1,0 +1,11 @@
+$ FL_STORE_BACKEND=redb fl store compact --json
+exit: 0
+--- stdout
+{
+  "command": "compact",
+  "compacted": false,
+  "engine": "redb",
+  "physical_path": "<DIR>/stores/fl.redb",
+  "reason": "compaction applies to the FerroStore (.fls) engine only; redb is not compacted, nothing to do"
+}
+--- stderr

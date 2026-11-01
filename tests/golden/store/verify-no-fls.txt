@@ -1,0 +1,5 @@
+$ fl store verify
+exit: 2
+--- stdout
+--- stderr
+error: no FerroStore at <DIR>/stores/fl.fls; `fl store verify` compares a .redb with its .fls (`fl store migrate` makes one)

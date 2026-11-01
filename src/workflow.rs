@@ -4,7 +4,7 @@ use fl_core::ids::{Kind, ProjectId, WorkflowId, WorkflowRunId};
 use fl_core::iri::Iri;
 use fl_core::store::{StoreError, WorkflowStore};
 use fl_core::workflow::{WorkflowDef, WorkflowRun, validate_workflow_def};
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::{FORMAT_WITH_WORKFLOW, RedbStore, additive, backend, decode, index_new, raise_format};
 

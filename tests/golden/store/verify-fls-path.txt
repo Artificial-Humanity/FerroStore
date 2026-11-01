@@ -1,0 +1,5 @@
+$ fl --db <DIR>/stores/fl.fls store verify
+exit: 2
+--- stdout
+--- stderr
+error: <DIR>/stores/fl.fls names a .fls file; `fl store verify` takes the store's .redb path (the bound store, or --db <file>.redb)

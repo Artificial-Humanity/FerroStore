@@ -11,7 +11,7 @@ use fl_core::ids::{Kind, MessageId};
 use fl_core::iri::Iri;
 use fl_core::state::{StateError, validate_slug};
 use fl_core::store::{MessageStore, StoreError};
-use redb::{ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use redb::{ReadableTable, TableDefinition, TableHandle};
 
 use crate::state::{AGENT_BY_NAME, AGENTS};
 use crate::{

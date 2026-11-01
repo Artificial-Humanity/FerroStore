@@ -1,0 +1,5 @@
+$ FL_STORE_BACKEND=redb fl store compact
+exit: 0
+--- stdout
+compaction applies to the FerroStore (.fls) engine only; redb is not compacted, nothing to do
+--- stderr

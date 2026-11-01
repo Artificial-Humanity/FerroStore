@@ -375,10 +375,31 @@ pub enum ImportCheckError {
     Store(#[from] StoreError),
 }
 
+/// A store that records which manifest, if any, each project was imported
+/// from. Implemented by every engine, so [`ensure_import_current`] serves the
+/// CLI's [`crate::AnyStore`] and the hub's [`crate::RedbStore`] alike.
+pub trait ImportRecord: Catalog {
+    /// The hash of the manifest `project` was imported from, or `None` if this
+    /// store authors it.
+    fn imported_hash(&self, project: &ProjectId) -> Result<Option<String>, StoreError>;
+}
+
+impl ImportRecord for crate::RedbStore {
+    fn imported_hash(&self, project: &ProjectId) -> Result<Option<String>, StoreError> {
+        crate::RedbStore::imported_hash(self, project)
+    }
+}
+
+impl ImportRecord for crate::AnyStore {
+    fn imported_hash(&self, project: &ProjectId) -> Result<Option<String>, StoreError> {
+        crate::AnyStore::imported_hash(self, project)
+    }
+}
+
 /// Spec §4.5: on an importing machine, the working tree's manifest must be the one this store
 /// imported. A project this store authors passes.
-pub fn ensure_import_current(
-    store: &crate::RedbStore,
+pub fn ensure_import_current<S: ImportRecord + ?Sized>(
+    store: &S,
     project: &ProjectId,
 ) -> Result<(), ImportCheckError> {
     let Some(recorded) = store.imported_hash(project)? else {

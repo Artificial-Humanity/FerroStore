@@ -1,0 +1,5 @@
+$ fl store migrate
+exit: 2
+--- stdout
+--- stderr
+error: <DIR>/stores/fl.fls already exists: this store is already migrated (`fl store verify` compares the pair); `fl store migrate` only creates a new .fls

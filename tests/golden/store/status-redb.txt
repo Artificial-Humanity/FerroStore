@@ -1,0 +1,10 @@
+$ FL_STORE_BACKEND=redb fl store status
+exit: 0
+--- stdout
+engine:         redb
+logical path:   <DIR>/stores/fl.redb
+physical path:  <DIR>/stores/fl.redb
+exists:         yes
+size:           1056768 bytes
+format version: 2
+--- stderr

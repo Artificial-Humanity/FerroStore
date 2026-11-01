@@ -13,18 +13,46 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub mod any;
+pub mod cli;
+pub mod code_knowledge;
 pub mod ferrostore;
 pub mod ferrowire;
+pub mod knowledge;
 pub mod manifest;
+pub mod migrate;
 pub mod private;
+pub mod rollup;
 pub mod state;
 pub mod workflow;
 
+#[cfg(test)]
+mod manifest_conformance;
+
+pub use any::{
+    AnyStats, AnyStore, BACKEND_ENV, BackendKind, COMPACT_FERRO_ONLY, DEFAULT_BACKEND,
+    MigrationLock, StoreOptions, Unmigrated, choose_backend, ferro_stats_at, forget_fallback,
+    is_redb_busy, migrate_locked, open_redb, open_store, open_store_for_scan, open_store_with,
+    physical_path, store_exists, store_identity,
+};
+pub use code_knowledge::{
+    CodeSession, CodeSidecar, CodeSidecarCache, DEFAULT_CODE_SYNC_BUDGET, RankedCode, search_code,
+    search_code_with, sidecar_path,
+};
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
-    EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit,
-    RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp, VectorHit, VectorMetric,
-    VectorStorage, ZoneMap, default_socket_path_for_store, migrate_redb_to_ferrostore,
+    ConnectOptions, EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup,
+    KnowledgeHit, RecordEnvelope, ServerAuth, SyncAdapter, SyncBatch, SyncMode, SyncOp,
+    Transaction, VectorHit, VectorMetric, VectorStorage, ZoneMap, default_socket_path_for_store,
+    migrate_redb_to_ferrostore,
+};
+pub use knowledge::{
+    DEFAULT_SYNC_BUDGET, IndexPolicy, RankedHits, SearchMode, rank_bm25, rank_state_entries,
+    rank_state_entries_read_only, rank_state_entries_with,
+};
+pub use rollup::{
+    AttemptTotals, GateRunTotals, TotalsSource, attempt_totals, attempt_totals_from_rows,
+    gate_run_totals, gate_run_totals_from_rows,
 };
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};
@@ -123,6 +151,31 @@ pub const FORMAT_WITH_WIRE: u64 = 7;
 /// workflow tables. This build opens 2 to 8.
 pub const FORMAT_WITH_WORKFLOW: u64 = 8;
 
+/// Every schema version this build opens, oldest first. Both `RedbStore` and
+/// `FerroStore` use this one ladder, so `format_version()` means the same on
+/// both; a new schema step adds a constant here and an upgrade for both.
+pub(crate) const FORMAT_LADDER: [u64; 7] = [
+    FORMAT_VERSION,
+    FORMAT_WITH_IMPORTS,
+    FORMAT_WITH_LEDGER_ROOT,
+    FORMAT_WITH_ROUTING,
+    FORMAT_WITH_STATE,
+    FORMAT_WITH_WIRE,
+    FORMAT_WITH_WORKFLOW,
+];
+
+/// `FormatVersion` unless `found` is on [`FORMAT_LADDER`].
+pub(crate) fn check_format(found: Option<u64>) -> Result<(), StoreError> {
+    match found {
+        Some(v) if FORMAT_LADDER.contains(&v) => Ok(()),
+        _ => Err(StoreError::FormatVersion {
+            found,
+            oldest: FORMAT_VERSION,
+            newest: FORMAT_WITH_WORKFLOW,
+        }),
+    }
+}
+
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
 const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
@@ -153,8 +206,49 @@ const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
 
 pub struct RedbStore {
-    pub(crate) db: Database,
+    pub(crate) db: Db,
     pub(crate) label: String,
+}
+
+/// The redb database behind a [`RedbStore`]: opened for writing, or, for a
+/// store only read (see [`RedbStore::open_read_only`]), read-only. A read-only
+/// open does not rewrite the file (opening it for writing does: its pages and
+/// its mtime change), and refuses every write.
+pub(crate) enum Db {
+    Write(Database),
+    Read(redb::ReadOnlyDatabase),
+}
+
+/// Why a write transaction could not begin.
+#[derive(Debug)]
+pub(crate) enum BeginWriteError {
+    Redb(redb::TransactionError),
+    ReadOnly,
+}
+
+impl std::fmt::Display for BeginWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Redb(e) => e.fmt(f),
+            Self::ReadOnly => f.write_str("the store was opened read-only"),
+        }
+    }
+}
+
+impl Db {
+    pub(crate) fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        match self {
+            Self::Write(db) => db.begin_read(),
+            Self::Read(db) => db.begin_read(),
+        }
+    }
+
+    pub(crate) fn begin_write(&self) -> Result<redb::WriteTransaction, BeginWriteError> {
+        match self {
+            Self::Write(db) => db.begin_write().map_err(BeginWriteError::Redb),
+            Self::Read(_) => Err(BeginWriteError::ReadOnly),
+        }
+    }
 }
 
 /// What an import did, for the person who ran it.
@@ -470,6 +564,65 @@ fn routed_store_is_taken() -> StoreError {
     )
 }
 
+/// Why `path` could not be opened, when a FerroStore migration made it
+/// read-only: the open was refused for permission and the file has no owner
+/// write bit, the mode `migrate_verified` leaves a migrated `.redb` in.
+/// `None` for any other failure.
+fn frozen_by_migration(path: &Path, err: &redb::DatabaseError) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let redb::DatabaseError::Storage(redb::StorageError::Io(io)) = err else {
+        return None;
+    };
+    if io.kind() != std::io::ErrorKind::PermissionDenied {
+        return None;
+    }
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    if mode & 0o200 != 0 {
+        return None;
+    }
+    let fls = physical_path(path, BackendKind::Ferro);
+    let fls_shown = private::shown_path(&fls);
+    let found = if fls.exists() {
+        "it exists"
+    } else {
+        "it does not exist"
+    };
+    let rollback = match private::quoted_path(path) {
+        Some(quoted) => format!("run: chmod 600 {quoted}"),
+        None => "run chmod 600 on it yourself; its name contains characters that cannot be \
+                 pasted safely"
+            .to_string(),
+    };
+    Some(format!(
+        "{io}: {redb} is read-only (mode {mode:o}), as a FerroStore migration leaves it once it \
+         has moved the store to {fls_shown} ({found}). Use the FerroStore engine: open \
+         {fls_shown}, or set {BACKEND_ENV}=ferro. To roll back to redb instead, {rollback}",
+        mode = mode & 0o7777,
+        redb = private::shown_path(path),
+    ))
+}
+
+/// A shared lock on a redb file, held while this value lives. It reads the file
+/// and writes nothing: the file may be 0400, and its bytes and mtime stay as
+/// they are (opening a [`RedbStore`] rewrites internal pages). It is refused
+/// while any process holds the file open for write, as a [`RedbStore`] open
+/// does, so [`is_redb_busy`] recognises that refusal. A caller that copies the
+/// file holds this across the copy and gets a copy no writer is changing.
+pub struct RedbSharedLock {
+    _db: redb::ReadOnlyDatabase,
+}
+
+impl RedbSharedLock {
+    pub fn acquire(path: &Path) -> Result<Self, StoreError> {
+        redb::ReadOnlyDatabase::open(path)
+            .map(|db| Self { _db: db })
+            .map_err(|e| StoreError::Unreachable {
+                store: path.display().to_string(),
+                cause: e.to_string(),
+            })
+    }
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         Self::open_with_retries(path, 200)
@@ -498,9 +651,10 @@ impl RedbStore {
                     std::thread::sleep(std::time::Duration::from_millis(15));
                 }
                 Err(e) => {
+                    let cause = frozen_by_migration(path, &e).unwrap_or_else(|| e.to_string());
                     return Err(StoreError::Unreachable {
                         store: label.clone(),
-                        cause: e.to_string(),
+                        cause,
                     });
                 }
             }
@@ -519,26 +673,60 @@ impl RedbStore {
         match found {
             // No META table at all: a brand-new file.
             None => Self::create_tables(&db)?,
-            Some(Some(v))
-                if v == FORMAT_VERSION
-                    || v == FORMAT_WITH_IMPORTS
-                    || v == FORMAT_WITH_LEDGER_ROOT
-                    || v == FORMAT_WITH_ROUTING
-                    || v == FORMAT_WITH_STATE
-                    || v == FORMAT_WITH_WIRE
-                    || v == FORMAT_WITH_WORKFLOW => {}
-            Some(v) => {
-                return Err(StoreError::FormatVersion {
-                    found: v,
-                    oldest: FORMAT_VERSION,
-                    newest: FORMAT_WITH_WORKFLOW,
-                });
-            }
+            Some(v) => check_format(v)?,
         }
         // Only a report, and only after the open worked: a store others can reach is the owner's
         // to fix, and a stat error here is no reason to fail the open.
         private::warn_if_loose(path);
-        Ok(Self { db, label })
+        Ok(Self {
+            db: Db::Write(db),
+            label,
+        })
+    }
+
+    /// Open the redb file at `path` for reading only, waiting up to `retries`
+    /// times, 15 ms apart, for a process that holds it for writing. Nothing is
+    /// created, written or touched (not its bytes, not its mtime); every
+    /// write through the store fails. A file that is not an initialised store
+    /// of a known format, or that needs repair, is an error here (the
+    /// ordinary [`RedbStore::open`] decides what to do with it).
+    pub fn open_read_only(path: &Path, retries: u32) -> Result<Self, StoreError> {
+        let label = path.display().to_string();
+        let mut attempts = 0u32;
+        let db = loop {
+            match redb::ReadOnlyDatabase::open(path) {
+                Ok(db) => break db,
+                Err(e)
+                    if attempts < retries
+                        && (e.to_string().contains("Database already open")
+                            || e.to_string().contains("Cannot acquire lock")) =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(e) => {
+                    return Err(StoreError::Unreachable {
+                        store: label,
+                        cause: e.to_string(),
+                    });
+                }
+            }
+        };
+        let found = {
+            let tx = db.begin_read().map_err(backend)?;
+            match tx.open_table(META) {
+                Ok(meta) => meta.get(FORMAT_KEY).map_err(backend)?.map(|v| v.value()),
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(backend(format!("{label} is not an initialised store")));
+                }
+                Err(e) => return Err(backend(e)),
+            }
+        };
+        check_format(found)?;
+        Ok(Self {
+            db: Db::Read(db),
+            label,
+        })
     }
 
     fn create_tables(db: &Database) -> Result<(), StoreError> {
@@ -2193,7 +2381,7 @@ mod tests {
         // the real `GATES` definition itself and fail right there, before we
         // ever get to call `add_gate`.
         let store = RedbStore {
-            db,
+            db: Db::Write(db),
             label: path.display().to_string(),
         };
 
@@ -2732,11 +2920,10 @@ mod tests {
         );
     }
 
-    use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};
     use fl_core::model::{Regret, Transition};
 
-    /// A well-formed ledger root (ruling 20).
-    const ROOT_A: &str = "0123456789abcdef0123456789abcdef01234567";
+    // The export/import contract runs against both stores in
+    // `manifest_conformance`; what stays here is redb's own file format.
 
     /// An authoring store with one project: gates `fmt` and `lint`, and a
     /// transition over both. Returns the store's guard too.
@@ -2759,264 +2946,6 @@ mod tests {
         })
         .unwrap();
         (s, dir, p, g1, g2)
-    }
-
-    fn stamp(s: &RedbStore, g: &GateId, commit: &str) {
-        let mut def = s.get_gate(g).unwrap().unwrap();
-        def.last_pass_commit = Some(commit.into());
-        s.update_gate(&def).unwrap();
-    }
-
-    #[test]
-    fn an_import_writes_every_item_under_its_own_iri_and_marks_the_project() {
-        let (a, _ga, p, g1, g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        let (b, _gb) = fresh();
-        let report = b.import_manifest(&m, "/elsewhere").unwrap();
-        assert_eq!((report.gates_added, report.transitions), (2, 1));
-        assert_eq!(b.get_project(&p).unwrap().unwrap().root, "/elsewhere");
-        assert_eq!(b.get_gate(&g1).unwrap(), a.get_gate(&g1).unwrap());
-        assert!(b.owns(g2.iri()).unwrap());
-        assert!(b.get_transition(&p, "ship").unwrap().is_some());
-        assert_eq!(b.imported_hash(&p).unwrap(), Some(m.content_sha256.clone()));
-        assert!(b.handle_of(Kind::Gate, g1.iri()).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_store_that_never_imported_reads_as_nothing_imported() {
-        let (s, _g) = fresh();
-        let p = s.add_project("/p").unwrap();
-        assert_eq!(s.imported_hash(&p).unwrap(), None);
-    }
-
-    #[test]
-    fn the_authoring_store_refuses_to_import_its_own_project() {
-        let (a, _g, p, _, _) = authoring();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        let err = a.import_manifest(&m, "/author").unwrap_err();
-        assert!(matches!(err, ManifestError::AuthoringStore(_)), "{err}");
-    }
-
-    #[test]
-    fn an_importing_store_refuses_to_export() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        let err = b.export_manifest(&p, "c1", 8, None).unwrap_err();
-        assert!(matches!(err, ManifestError::NotAuthoring(_)), "{err}");
-    }
-
-    #[test]
-    fn an_imported_gate_can_earn_a_pass_mark_but_cannot_be_edited() {
-        let (a, _ga, p, g1, _) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        stamp(&b, &g1, "c1");
-        assert_eq!(
-            b.get_gate(&g1)
-                .unwrap()
-                .unwrap()
-                .last_pass_commit
-                .as_deref(),
-            Some("c1")
-        );
-
-        let mut edited = b.get_gate(&g1).unwrap().unwrap();
-        edited.name = "renamed".into();
-        let err = b.update_gate(&edited).unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
-
-        let err = b
-            .add_gate(&p, "new", kind(), selector(), 1, "c1", "o")
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
-
-        let err = b
-            .add_transition(Transition {
-                project: p.clone(),
-                name: "other".into(),
-                from: State::Todo,
-                to: State::Doing,
-                regret: Regret::Low,
-                gates: vec![],
-            })
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
-    }
-
-    #[test]
-    fn a_reimport_keeps_the_mark_of_an_unchanged_gate_and_drops_a_changed_ones() {
-        let (a, _ga, p, g1, g2) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        stamp(&b, &g1, "c1");
-        stamp(&b, &g2, "c1");
-
-        let mut changed = a.get_gate(&g2).unwrap().unwrap();
-        changed.authored_at_commit = "c2".into();
-        a.update_gate(&changed).unwrap();
-        let g3 = a
-            .add_gate(&p, "new", kind(), selector(), 1, "c2", "o")
-            .unwrap();
-
-        let report = b
-            .import_manifest(&a.export_manifest(&p, "c2", 8, None).unwrap(), "/x")
-            .unwrap();
-        assert_eq!(
-            (
-                report.gates_added,
-                report.gates_changed,
-                report.gates_unchanged
-            ),
-            (1, 1, 1)
-        );
-        assert_eq!(
-            b.get_gate(&g1)
-                .unwrap()
-                .unwrap()
-                .last_pass_commit
-                .as_deref(),
-            Some("c1")
-        );
-        assert_eq!(b.get_gate(&g2).unwrap().unwrap().last_pass_commit, None);
-        assert_eq!(b.get_gate(&g2).unwrap().unwrap().authored_at_commit, "c2");
-        assert!(b.handle_of(Kind::Gate, g3.iri()).unwrap().is_some());
-    }
-
-    #[test]
-    fn an_import_refuses_a_manifest_it_did_not_verify() {
-        let (a, _ga, p, _, _) = authoring();
-        let mut m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        m.body.gates[0].name = "edited".into();
-        let (b, _gb) = fresh();
-        let err = b.import_manifest(&m, "/x").unwrap_err();
-        assert!(matches!(err, ManifestError::HandEdited { .. }), "{err}");
-        assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
-    }
-
-    #[test]
-    fn a_fresh_import_onto_a_root_another_project_uses_is_refused() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        let local = b.add_project("/x").unwrap();
-        let err = b
-            .import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap_err();
-        assert!(
-            matches!(err, ManifestError::RootTaken { ref other, .. } if *other == local),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn a_reimport_from_another_checkout_moves_the_root_and_says_so() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        assert_eq!(b.import_manifest(&m, "/one").unwrap().root_moved, None);
-        let report = b.import_manifest(&m, "/two").unwrap();
-        assert_eq!(report.root_moved, Some(("/one".into(), "/two".into())));
-        assert_eq!(b.get_project(&p).unwrap().unwrap().root, "/two");
-    }
-
-    #[test]
-    fn a_reimport_mirrors_the_manifests_transitions() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
-        b.import_manifest(&first, "/x").unwrap();
-        let mut body = first.body.clone();
-        body.transitions.clear();
-        let without = Manifest {
-            content_sha256: content_sha256(&body).unwrap(),
-            body,
-        };
-        let report = b.import_manifest(&without, "/x").unwrap();
-        assert!(b.list_transitions(&p).unwrap().is_empty());
-        assert_eq!(report.transitions_removed, vec!["ship".to_string()]);
-    }
-
-    // Routing spec §1.2: the importing machine routes as the authoring one.
-    #[test]
-    fn an_export_carries_the_map_and_an_import_writes_it_raising_the_store_to_5() {
-        use fl_core::routing::{Routes, RoutingMap};
-        let (a, _ga, p, _, _) = authoring();
-        a.set_routes(&p, &RoutingMap::starting()).unwrap();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        assert_eq!(m.body.format_version, 3);
-        assert_eq!(m.body.routing, Some(RoutingMap::starting()));
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("b.redb");
-        {
-            let b = RedbStore::open(&path).unwrap();
-            let report = b.import_manifest(&m, "/x").unwrap();
-            assert_eq!(report.areas, Some(5));
-            assert_eq!(b.routes(&p).unwrap(), Some(RoutingMap::starting()));
-            assert!(b.holds_routing().unwrap());
-        }
-        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
-    }
-
-    // Routing spec §1.2: an older checked-out manifest must not un-route one
-    // machine.
-    #[test]
-    fn an_import_that_would_drop_the_routing_map_is_refused() {
-        use fl_core::routing::{Routes, RoutingMap};
-        let (a, _ga, p, _, _) = authoring();
-        let unrouted = a.export_manifest(&p, "c1", 7, None).unwrap();
-        a.set_routes(&p, &RoutingMap::starting()).unwrap();
-        let routed = a.export_manifest(&p, "c2", 8, None).unwrap();
-        let (b, _gb) = fresh();
-        b.import_manifest(&routed, "/x").unwrap();
-        let err = b.import_manifest(&unrouted, "/x").unwrap_err();
-        assert!(matches!(err, ManifestError::WouldDropRouting(_)), "{err}");
-        assert!(
-            err.to_string().contains("would un-route the project"),
-            "{err}"
-        );
-        assert_eq!(
-            b.routes(&p).unwrap(),
-            Some(RoutingMap::starting()),
-            "nothing written"
-        );
-        // A map that changed is imported: areas come and go (decision 15).
-        a.set_routes(&p, &RoutingMap::starting().without("design"))
-            .unwrap();
-        b.import_manifest(&a.export_manifest(&p, "c3", 9, None).unwrap(), "/x")
-            .unwrap();
-        assert_eq!(b.routes(&p).unwrap().unwrap().declared().len(), 4);
-    }
-
-    // Routing spec decision 20: an import keeps a routed store to one
-    // project, both ways round.
-    #[test]
-    fn an_import_never_puts_a_routed_project_beside_another() {
-        use fl_core::routing::RoutingMap;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_routes(&p, &RoutingMap::starting()).unwrap();
-        let routed = a.export_manifest(&p, "c1", 7, None).unwrap();
-        let (b, _gb) = fresh();
-        b.add_project("/elsewhere").unwrap();
-        let err = b.import_manifest(&routed, "/x").unwrap_err().to_string();
-        assert!(err.contains("needs a store of its own"), "{err}");
-        assert!(!b.holds_routing().unwrap(), "nothing written");
-        let (c, _gc) = fresh();
-        c.import_manifest(&routed, "/x").unwrap();
-        let (o, _go, op, _, _) = authoring();
-        let unrouted = o.export_manifest(&op, "c1", 7, None).unwrap();
-        let err = c.import_manifest(&unrouted, "/y").unwrap_err().to_string();
-        assert!(err.contains("needs a store of its own"), "{err}");
-        assert_eq!(c.list_projects().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn imported_hash_of_a_project_this_store_never_held_is_not_owned() {
-        let (s, _g) = fresh();
-        let err = s.imported_hash(&ProjectId(seq_iri(42))).unwrap_err();
-        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
     }
 
     #[test]
@@ -3042,66 +2971,6 @@ mod tests {
         drop(db);
         let b = RedbStore::open(&path).unwrap();
         assert!(b.imported_hash(&p).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_reimport_that_removes_a_gate_is_refused_and_changes_nothing() {
-        let (a, _ga, p, g1, g2) = authoring();
-        let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
-        b.import_manifest(&first, "/x").unwrap();
-
-        let mut body = first.body.clone();
-        body.gates.retain(|g| g.id != g2);
-        for t in &mut body.transitions {
-            t.gates.retain(|g| *g != g2);
-        }
-        let shrunk = Manifest {
-            content_sha256: content_sha256(&body).unwrap(),
-            body,
-        };
-        let err = b.import_manifest(&shrunk, "/x").unwrap_err();
-        assert!(
-            matches!(err, ManifestError::WouldRemoveGate { ref id, ref name } if *id == g2 && name == "lint"),
-            "{err}"
-        );
-        assert_eq!(b.imported_hash(&p).unwrap(), Some(first.content_sha256));
-        assert!(b.get_gate(&g1).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_gate_held_locally_under_another_project_is_refused_and_writes_nothing() {
-        let (a, _ga, p, _g1, _g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-
-        // `b` authors its own project locally and holds a gate under it —
-        // the manifest below is rewritten to claim that same gate id for a
-        // project `b` has never held.
-        let (b, _gb) = fresh();
-        let q = b.add_project("/local").unwrap();
-        let local_gate = b
-            .add_gate(&q, "local", kind(), selector(), 1, "c0", "o")
-            .unwrap();
-
-        let old_id = m.body.gates[0].id.clone();
-        let mut body = m.body.clone();
-        body.gates[0].id = local_gate.clone();
-        for t in &mut body.transitions {
-            for gid in &mut t.gates {
-                if *gid == old_id {
-                    *gid = local_gate.clone();
-                }
-            }
-        }
-        let swapped = Manifest {
-            content_sha256: content_sha256(&body).unwrap(),
-            body,
-        };
-
-        let err = b.import_manifest(&swapped, "/x").unwrap_err();
-        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
-        assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
-        assert_eq!(b.get_gate(&local_gate).unwrap().unwrap().project, q);
     }
 
     #[test]
@@ -3225,92 +3094,6 @@ mod tests {
         assert_eq!(s.ledger_root("R_2").unwrap(), None);
     }
 
-    #[test]
-    fn an_import_never_lowers_the_format_of_a_store_that_records_a_ledger_root() {
-        use fl_core::store::Bindings;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("b.redb");
-        let (a, _ga, p, _, _) = authoring();
-        {
-            let b = RedbStore::open(&path).unwrap();
-            b.set_ledger_root("R_9", "abc").unwrap();
-            b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-                .unwrap();
-        }
-        let db = redb::Database::open(&path).unwrap();
-        let tx = db.begin_read().unwrap();
-        let meta = tx.open_table(META).unwrap();
-        assert_eq!(
-            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
-            Some(FORMAT_WITH_LEDGER_ROOT)
-        );
-    }
-
-    #[test]
-    fn an_export_carries_the_root_of_the_repository_it_is_told_and_no_other() {
-        use fl_core::store::Bindings;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", ROOT_A).unwrap();
-        let m = a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap();
-        assert_eq!(m.body.format_version, 2);
-        assert_eq!(
-            m.body.ledger_root,
-            Some(LedgerRoot {
-                repository_node_id: "R_1".into(),
-                commit: ROOT_A.into(),
-            })
-        );
-        for other in [None, Some("R_2")] {
-            let m = a.export_manifest(&p, "c1", 7, other).unwrap();
-            assert_eq!(
-                (m.body.format_version, m.body.ledger_root),
-                (1, None),
-                "{other:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_import_records_the_manifests_ledger_root() {
-        use fl_core::store::Bindings;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", ROOT_A).unwrap();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
-            .unwrap();
-        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some(ROOT_A));
-        // ⚠ An import that records a root makes the
-        // store one an older fl refuses, not one it opens and exports
-        // without the root.
-        let tx = b.db.begin_read().unwrap();
-        let meta = tx.open_table(META).unwrap();
-        assert_eq!(
-            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
-            Some(FORMAT_WITH_LEDGER_ROOT)
-        );
-    }
-
-    #[test]
-    fn an_import_naming_another_root_for_a_known_repository_is_refused_and_writes_nothing() {
-        use fl_core::store::Bindings;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", ROOT_A).unwrap();
-        let (b, _gb) = fresh();
-        b.set_ledger_root("R_1", "other").unwrap();
-        let err = b
-            .import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ManifestError::Store(StoreError::LedgerRootChanged { .. })
-            ),
-            "{err}"
-        );
-        assert!(!b.owns(p.iri()).unwrap(), "nothing was written");
-        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("other"));
-    }
-
     // Routing spec §1.2, §1.4: the map is kept, raising the store to 5 in
     // the same write; a store holds routing once its project has a map.
     #[test]
@@ -3383,23 +3166,6 @@ mod tests {
             assert_eq!(s.routes(&p).unwrap(), None);
         }
         assert_eq!(format_at(&path), Some(FORMAT_VERSION));
-    }
-
-    // The map is authored where the project is (routing spec §1.2): an
-    // importing store's copy comes from the manifest only.
-    #[test]
-    fn an_imported_projects_routing_map_cannot_be_changed_here() {
-        use fl_core::routing::RoutingMap;
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        let err = b.set_routes(&p, &RoutingMap::starting()).unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err:?}");
-        assert!(
-            err.to_string().contains("change the routing map of"),
-            "{err}"
-        );
     }
 
     #[test]
@@ -3604,7 +3370,7 @@ mod tests {
                     notes: None,
                 }),
                 at: At::from_unix_millis(10),
-                by: "jarvis".into(),
+                by: "carol".into(),
             })
             .unwrap()
         };
@@ -3638,9 +3404,9 @@ mod tests {
                 .send_wire(SendWireArgs {
                     id: None,
                     sender_id: None,
-                    sender_name: "jarvis".into(),
+                    sender_name: "carol".into(),
                     sender_host: Some("build-host".into()),
-                    to: WireAddress::AgentName("ferris".into()),
+                    to: WireAddress::AgentName("bob".into()),
                     kind: MessageKind::Mail,
                     urgency: MessageUrgency::Normal,
                     durable: false,
@@ -3666,7 +3432,7 @@ mod tests {
         reopened
             .update_wire_receipt(
                 &msg.id,
-                "ferris",
+                "bob",
                 DeliveryStatus::Acked,
                 false,
                 At::from_unix_millis(15),
@@ -3715,7 +3481,7 @@ mod tests {
                         title: "Build".into(),
                         prompt: "Run build.".into(),
                         assignee: AssigneeRule::Agent {
-                            name: "felicia".into(),
+                            name: "alice".into(),
                         },
                         reviews_step: None,
                         require_different_vendor: false,
@@ -3737,7 +3503,7 @@ mod tests {
                     max_tokens: None,
                     declared_keys: BTreeMap::new(),
                     authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-                    authored_by: "ferris".into(),
+                    authored_by: "bob".into(),
                 })
                 .unwrap();
             let run = s
@@ -3747,7 +3513,7 @@ mod tests {
                         &wf,
                         "CI Run 1",
                         At::from_unix_millis(100),
-                        "ferris",
+                        "bob",
                     )
                     .unwrap(),
                 )
@@ -3770,5 +3536,44 @@ mod tests {
             reopened.handle_of(Kind::WorkflowRun, run.id.iri()).unwrap(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn a_read_only_open_reads_without_touching_the_file_and_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.redb");
+        let project = {
+            let s = RedbStore::open(&path).unwrap();
+            s.add_project("/repo").unwrap()
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        {
+            let ro = RedbStore::open_read_only(&path, 0).unwrap();
+            assert!(ro.owns(project.iri()).unwrap());
+            assert_eq!(ro.get_project(&project).unwrap().unwrap().root, "/repo");
+            let err = ro.add_project("/other").expect_err("refused");
+            assert!(err.to_string().contains("read-only"), "{err}");
+            // Shared: a second reader is fine; a writer is not.
+            drop(RedbStore::open_read_only(&path, 0).unwrap());
+            let busy = RedbStore::open_with_retries(&path, 0).err().expect("held");
+            assert!(crate::is_redb_busy(&busy), "{busy}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        // Held for writing: a read-only open is busy, not a different error.
+        let writer = RedbStore::open(&path).unwrap();
+        let busy = RedbStore::open_read_only(&path, 0).err().expect("held");
+        assert!(crate::is_redb_busy(&busy), "{busy}");
+        drop(writer);
+        // Not a store: an error, and nothing created.
+        let missing = dir.path().join("missing.redb");
+        assert!(RedbStore::open_read_only(&missing, 0).is_err());
+        assert!(!missing.exists());
+        let empty = dir.path().join("empty.redb");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(RedbStore::open_read_only(&empty, 0).is_err());
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
     }
 }

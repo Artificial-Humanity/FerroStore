@@ -1,0 +1,11 @@
+$ fl store status
+exit: 0
+--- stdout
+engine:         ferro
+logical path:   <DIR>/stores/fl.redb
+physical path:  <DIR>/stores/fl.fls
+exists:         no
+size:           -
+format version: n/a (not available on ferro yet)
+note: <DIR>/stores/fl.redb holds a redb store and the selected engine is ferro; the next command that opens it migrates it (or run `fl store migrate`)
+--- stderr

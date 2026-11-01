@@ -59,6 +59,36 @@ pub(super) const WORKFLOW_DEFS: &str = "workflow_defs";
 pub(super) const WORKFLOW_SLUGS: &str = "workflow_slugs";
 pub(super) const WORKFLOW_RUNS: &str = "workflow_runs";
 
+/// The store's own bookkeeping. Not a redb table: no trait lists it, the
+/// migration writes it from redb's `meta.format_version`, and the verifier
+/// checks it as its own entry.
+pub(super) const SCHEMA_COLLECTION: &str = "__meta";
+/// A collection whose name starts with this belongs to the store: only its own
+/// transactions write it. Public `put_doc` / `delete_doc` refuse it. Outbound
+/// sync batches carry its ops like any other; an inbound sync batch applies
+/// one only as a schema raise (`admit_inbound` in `mod.rs`) and drops the rest.
+pub(super) const RESERVED_PREFIX: &str = "__";
+
+/// `true` for a collection only the store itself writes ([`RESERVED_PREFIX`]).
+pub(super) fn is_reserved(collection: &str) -> bool {
+    collection.starts_with(RESERVED_PREFIX)
+}
+
+/// `Err` naming `collection` when it is reserved; `what` is the refused call.
+pub(super) fn refuse_reserved(collection: &str, what: &str) -> Result<(), StoreError> {
+    if is_reserved(collection) {
+        return Err(backend(format!(
+            "{what} refused: collection `{collection}` is reserved \
+             (a `{RESERVED_PREFIX}` collection is written only by the store itself)"
+        )));
+    }
+    Ok(())
+}
+/// `(SCHEMA_COLLECTION, SCHEMA_KEY)` holds the schema version: the same ladder
+/// as `RedbStore` (`FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`).
+pub(super) const SCHEMA_KEY: &str = "schema_version";
+/// redb's key for the schema version in `meta`. A FerroStore written before
+/// `__meta` existed may hold it in the `meta` collection.
 pub(super) const FORMAT_KEY: &str = "format_version";
 pub(super) const NEXT_RUN: &str = "next_run";
 pub(super) const NEXT_ATTEMPT: &str = "next_attempt";
@@ -313,10 +343,32 @@ pub(super) fn alias_unpublished(
     Ok(())
 }
 
+/// The schema version `txn` records: `("__meta", "schema_version")`, else the
+/// `("meta", "format_version")` a store from before `__meta` raised, else `None`.
+pub(super) fn schema_version(txn: &Txn) -> Result<Option<u64>, StoreError> {
+    schema_version_in(|collection, id| txn.get(collection, id))
+}
+
+/// [`schema_version`] over any document lookup.
+pub(super) fn schema_version_in(
+    get: impl Fn(&str, &str) -> Option<Value>,
+) -> Result<Option<u64>, StoreError> {
+    for (collection, id) in [(SCHEMA_COLLECTION, SCHEMA_KEY), (META, FORMAT_KEY)] {
+        if let Some(doc) = get(collection, id) {
+            return doc.as_u64().map(Some).ok_or_else(|| {
+                decode(format!(
+                    "the schema version at `{collection}`/`{id}` is not an unsigned integer: {doc}"
+                ))
+            });
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn raise_format(txn: &mut Txn, to: u64) -> Result<(), StoreError> {
-    let now = get_json::<u64>(txn, META, FORMAT_KEY)?.unwrap_or(crate::FORMAT_VERSION);
+    let now = schema_version(txn)?.unwrap_or(crate::FORMAT_VERSION);
     if now < to {
-        put_json(txn, META, FORMAT_KEY, &to)?;
+        put_json(txn, SCHEMA_COLLECTION, SCHEMA_KEY, &to)?;
     }
     Ok(())
 }
