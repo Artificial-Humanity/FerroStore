@@ -1,0 +1,63 @@
+# The verification trio, run on every pull request and on every push to `main`:
+# `cargo fmt --all --check`, `cargo clippy --all-targets --workspace -- -D warnings`
+# and `cargo test --workspace`. A merge must not land with any of them red.
+#
+# On a pull request this run GATES the merge: the `main` ruleset requires the
+# `test, clippy, fmt` check by name, so renaming the job below silently breaks
+# the gate. The push to `main` runs the trio again on the merged result.
+#
+# A branch push alone does NOT trigger a run. Every branch lands through a pull
+# request, so running on both events ran the same commit twice. To check a
+# branch with no pull request yet, start the workflow by hand.
+#
+# No third-party actions are used. `actions/checkout` is GitHub's own; every
+# other step is a command from the toolchain, so the supply chain for a run is
+# the same one a local `cargo test` already trusts.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deliberately no global RUSTFLAGS: `-D warnings` there applies to
+# dependencies too, so an upstream crate's warning would fail this repo's
+# build for a reason nobody here can fix. The `-D warnings` that matters is
+# on the clippy step, scoped to this workspace.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  trio:
+    name: test, clippy, fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the toolchain this run used
+        run: |
+          rustup component add clippy rustfmt
+          rustc --version
+          cargo --version
+          git --version
+
+      # Formatting first: it is the cheapest to fail and the least ambiguous, so a
+      # drift is worth seeing before a compile.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      # The tests use temporary directories and in-process servers on Unix
+      # sockets and loopback TCP, so this step needs no external service.
+      - name: cargo test --workspace
+        run: cargo test --workspace

@@ -1,0 +1,24 @@
+[package]
+name = "fl-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "FerroStore: the single-file `.fls` embedded store for FerroLoop: document and BM25 engine, FerroMQ durable queue and event log, served mode, columnar analytics, HNSW vector and hybrid search, and sync adapters."
+repository = "https://github.com/Artificial-Humanity/FerroStore"
+
+[dependencies]
+# Pinned to a FerroLoop commit: see the README ("Why fl-core is pinned").
+fl-core = { git = "https://github.com/Artificial-Humanity/FerroLoop.git", rev = "af85c42feb097fa2e1e483391c774a2044dfce0c" }
+redb = "4.3.0"
+serde = { version = "1.0.229", features = ["derive"] }
+# Never enable `preserve_order` on serde_json: some FerroLoop layers re-encode
+# JSON and need a `Value`'s keys sorted.
+serde_json = "1.0.151"
+sha2 = "0.10"
+thiserror = "2.0.20"
+uuid = { version = "1.26", features = ["v7"] }
+
+[dev-dependencies]
+fl-core = { git = "https://github.com/Artificial-Humanity/FerroLoop.git", rev = "af85c42feb097fa2e1e483391c774a2044dfce0c", features = ["conformance"] }
+tempfile = "3.27.0"

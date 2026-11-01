@@ -1,0 +1,108 @@
+# Route PR review requests according to the Artificial Humanity agent rights hierarchy:
+# - Request Owner (`lmcfarlin`) review when a PR touches protected governance/CI paths,
+#   contains unattributed non-admin commits (missing `Co-authored-by:`), or is co-authored
+#   by `lab_manager` (`jarvis@artificialhumanity.io`).
+# - Otherwise, skip requesting `lmcfarlin` on GitHub and leave review to the project `lead`
+#   or `lab_manager` tier via `fl github pr`.
+#
+# ADMINS lists users, not the `admins` team: the workflow token cannot see org teams, so a team
+# review request fails ("Could not resolve to a node"). Keep ADMINS in step with that team.
+#
+# pull_request_target runs this file from the base branch with a write token, also for PRs from
+# forks. That is safe only because nothing here checks out or runs the PR's code — keep it so.
+name: Request admin review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  request:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate PR review tier and request admin review when required
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          ADMINS: lmcfarlin
+        run: |
+          set -euo pipefail
+
+          FILES=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
+          COMMITS_JSON=$(gh api "repos/$REPO/pulls/$PR/commits" --paginate --jq '.[]' | jq -s '.')
+
+          REQUIRE_OWNER=0
+          REASONS=()
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              .github/*|.fl/manifest.json|.agents/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|WORKFLOW.md|*/WORKFLOW.md|PERSONA.md|*/PERSONA.md|CONTRIBUTING.md|*/CONTRIBUTING.md)
+                REQUIRE_OWNER=1
+                REASONS+=("protected path: $file")
+                ;;
+            esac
+          done <<< "$FILES"
+
+          COMMIT_COUNT=$(printf '%s\n' "$COMMITS_JSON" | jq 'length')
+          COAUTHOR_COMMIT_COUNT=$(printf '%s\n' "$COMMITS_JSON" | jq '[.[] | select(.commit.message | test("(?im)^co-authored-by:"))] | length')
+          if [ "$COMMIT_COUNT" -eq 0 ] || [ "$COAUTHOR_COMMIT_COUNT" -eq 0 ]; then
+            REQUIRE_OWNER=1
+            REASONS+=("no agent Co-authored-by trailers found across PR commits")
+          fi
+
+          UNATTRIBUTED=$(printf '%s\n' "$COMMITS_JSON" | jq -r '
+            .[]
+            | select(((.author.login // "") | ascii_downcase) != "lmcfarlin")
+            | select((.commit.message | test("(?im)^co-authored-by:")) | not)
+            | .sha
+          ')
+          if [ -n "$UNATTRIBUTED" ]; then
+            REQUIRE_OWNER=1
+            REASONS+=("unattributed commit(s) missing Co-authored-by trailer: $(echo "$UNATTRIBUTED" | tr '\n' ' ')")
+          fi
+
+          LAB_MANAGER_COMMITS=$(printf '%s\n' "$COMMITS_JSON" | jq -r '
+            .[]
+            | select(.commit.message | test("(?im)^co-authored-by:.*jarvis@artificialhumanity\\.io"))
+            | .sha
+          ')
+          if [ -n "$LAB_MANAGER_COMMITS" ]; then
+            REQUIRE_OWNER=1
+            REASONS+=("co-authored by lab_manager (jarvis@artificialhumanity.io)")
+          fi
+
+          if [ "$REQUIRE_OWNER" -eq 0 ]; then
+            echo "PR #$PR is routed to the project lead or lab_manager tier; skipping Owner ($ADMINS) review request on GitHub."
+            exit 0
+          fi
+
+          echo "PR #$PR requires Owner review (${REASONS[*]})."
+
+          PR_JSON=$(gh api "repos/$REPO/pulls/$PR")
+          PR_AUTHOR=$(printf '%s\n' "$PR_JSON" | jq -r '.user.login // ""')
+          ALREADY_REQUESTED=$(printf '%s\n' "$PR_JSON" | jq -r '.requested_reviewers[].login // empty')
+          ALREADY_REVIEWED=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate --jq '.[].user.login // empty')
+
+          for u in $ADMINS; do
+            if [ "$u" = "$PR_AUTHOR" ]; then
+              echo "Skipping review request for $u (PR author)."
+              continue
+            fi
+            if printf '%s\n%s\n' "$ALREADY_REQUESTED" "$ALREADY_REVIEWED" | grep -Fxq "$u"; then
+              echo "Owner $u is already requested or has already reviewed PR #$PR."
+              continue
+            fi
+            gh api --method POST "repos/$REPO/pulls/$PR/requested_reviewers" \
+              -f "reviewers[]=$u" --jq '"review requested: \([.requested_reviewers[].login])"' \
+              || echo "::warning::could not request review from $u (a PR's author cannot review it)"
+            gh api --method POST "repos/$REPO/issues/$PR/assignees" \
+              -f "assignees[]=$u" --jq '"assigned: \([.assignees[].login])"'
+          done
